@@ -1,0 +1,2645 @@
+diff --git a/BIEVR/CMakeLists.txt b/BIEVR/CMakeLists.txt
+index 57c135e..7206f5b 100644
+--- a/BIEVR/CMakeLists.txt
++++ b/BIEVR/CMakeLists.txt
+@@ -27,6 +27,7 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+ find_package(Eigen3 REQUIRED)
+ find_package(Ceres REQUIRED)
+ find_package(TBB REQUIRED)
++find_package(Threads REQUIRED)
+ find_package(glog QUIET)  # usually re-exported transitively by Ceres
+ 
+ # ---------------------------------------------------------------------------
+@@ -73,6 +74,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
+   Eigen3::Eigen
+   Ceres::ceres
+   TBB::tbb
++  Threads::Threads
+ )
+ if(glog_FOUND)
+   target_link_libraries(${PROJECT_NAME} PUBLIC glog::glog)
+diff --git a/BIEVR/include/bievr_lio/bievr_map.h b/BIEVR/include/bievr_lio/bievr_map.h
+index 303e1d3..7543929 100644
+--- a/BIEVR/include/bievr_lio/bievr_map.h
++++ b/BIEVR/include/bievr_lio/bievr_map.h
+@@ -71,6 +71,23 @@ class BIEVRMap {
+   const Voxel* getVoxel(const size_t hash_idx) const;
+   bool nearestVoxel(const Point& point, size_t& result) const;
+ 
++  // Compact, key-sorted view of the observed voxels.
++  //
++  // The registration probes the map once per source point and per LM iteration. A
++  // hash probe costs a hash computation plus a scattered read into the voxel arena;
++  // a binary search over a contiguous 8-byte key array touches far fewer cache
++  // lines, and the same layout (parallel key / payload arrays sorted by the voxel
++  // key) is what a GPU port needs. `buildSortedIndex()` is O(V log V) and is meant
++  // to be called once per scan, between the map update of the previous scan and the
++  // registration of the current one.
++  //
++  // The stored pointers stay valid until the next mutating call; those bump
++  // `mutation_stamp_`, so a stale index reports `sortedIndexValid() == false` and
++  // the caller falls back to the hash lookup.
++  void buildSortedIndex() const;
++  bool sortedIndexValid() const { return sorted_stamp_ == mutation_stamp_; }
++  const Voxel* getVoxelSorted(const uint64_t key) const;
++
+   // Calls func(const Voxel&) for every observed voxel.
+   template <typename Func>
+   void forEachVoxel(Func&& func) const {
+@@ -130,6 +147,13 @@ class BIEVRMap {
+   ankerl::unordered_dense::map<size_t, VoxelEntry> map_;
+   std::list<size_t> voxels_cache_;
+ 
++  // Sorted lookup index, see buildSortedIndex(). `mutable` because building it does
++  // not change the map itself.
++  mutable std::vector<uint64_t> sorted_keys_;
++  mutable std::vector<const Voxel*> sorted_voxels_;
++  mutable uint64_t sorted_stamp_ = 0;
++  uint64_t mutation_stamp_ = 0;
++
+   Eigen::MatrixXd corner_offsets_;
+   std::vector<Point> neighbor_offsets_;
+ };
+diff --git a/BIEVR/include/bievr_lio/config_loader.h b/BIEVR/include/bievr_lio/config_loader.h
+index bc942a6..7ad2464 100644
+--- a/BIEVR/include/bievr_lio/config_loader.h
++++ b/BIEVR/include/bievr_lio/config_loader.h
+@@ -155,6 +155,8 @@ inline void printConfigOverview(const Config& config) {
+   os << "  max_size:             " << hc.map.max_size << "\n";
+   os << "  smooth:               " << yn(hc.map.smooth) << "\n";
+   os << "  weighted:             " << yn(hc.map.weighted) << "\n";
++  os << "  sorted_lookup:        " << yn(hc.registration.sorted_lookup) << "\n";
++  os << "  observability_state:  " << hc.observability_state << " (alpha " << hc.observability_alpha << ")\n";
+   os << "  frame:                " << hc.map_frame << "\n";
+   os << "preprocess:\n";
+   os << "  downsample_res_m:     " << hc.preprocess.downsample_resolution << "\n";
+@@ -184,6 +186,39 @@ inline void printConfigOverview(const Config& config) {
+     os << "  num_voxels:           " << ic.num_voxels << "\n";
+     os << "  degeneracy_ratio:     " << ic.degeneracy_ratio << "\n";
+     os << "  photo_scale:          " << hc.registration.photo_scale << "\n";
++    os << "  sequential_photo:     " << yn(hc.registration.sequential_photo) << "\n";
++    os << "  second_stage_mode:    " << hc.registration.second_stage_mode << "\n";
++    os << "  adaptive_photo_scale: " << yn(hc.registration.adaptive_photo_scale) << "\n";
++    if (hc.registration.adaptive_photo_scale) {
++      os << "  photo_scale_mode:     " << hc.registration.photo_scale_mode << "\n";
++      os << "  photo_window_frames:  " << hc.registration.photo_window_frames << "\n";
++    }
++    os << "  adaptive_photo_guard: " << yn(hc.registration.adaptive_photo_guard) << "\n";
++    if (hc.registration.adaptive_photo_guard) {
++      os << "  photo_guard_fraction:" << hc.registration.photo_guard_fraction << "\n";
++      os << "  photo_guard_max_alpha:" << hc.registration.photo_guard_max_alpha << "\n";
++    }
++    os << "  adaptive_beta:        " << yn(hc.registration.adaptive_beta) << "\n";
++    os << "  stage_max_translation_m: " << hc.registration.stage_max_translation_m << "\n";
++    os << "  stage_max_rotation_deg:  " << hc.registration.stage_max_rotation_deg << "\n";
++    os << "  photo_confidence:     " << yn(hc.registration.photo_confidence) << "\n";
++    os << "  incidence_residual:   " << yn(hc.registration.incidence_residual) << "\n";
++    if (hc.registration.incidence_residual)
++      os << "  incidence_scale:      " << hc.registration.incidence_scale << "\n";
++    if (hc.registration.photo_confidence) {
++      os << "  confidence_incidence: [" << hc.registration.confidence_incidence_full_deg << ", "
++         << hc.registration.confidence_incidence_deg << "] deg\n";
++      os << "  confidence_range_m:   [" << hc.registration.confidence_range_full_m << ", "
++         << hc.registration.confidence_range_stop_m << "] m\n";
++      os << "  confidence_min:       " << hc.registration.confidence_min << "\n";
++      os << "  confidence_in_info:   " << yn(hc.registration.confidence_in_photo_information)
++         << "\n";
++    }
++    if (hc.registration.adaptive_photo_scale) {
++      os << "  photo_scale_min:      " << hc.registration.photo_scale_min << "\n";
++      os << "  photo_scale_max:      " << hc.registration.photo_scale_max << "\n";
++      os << "  photo_scale_max_alpha:" << hc.registration.photo_scale_max_alpha << "\n";
++    }
+     os << "  smooth:               " << yn(hc.map.smooth_intensity) << "\n";
+   }
+   os << "imu:\n";
+@@ -252,6 +287,41 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
+   hc.map.max_size = static_cast<size_t>(max_size);
+   hc.map.smooth = yaml.get<bool>("map", "smooth", false);
+   hc.map.weighted = yaml.get<bool>("map", "weighted", false);
++  // Registration lookups through a key-sorted voxel index instead of the hash map.
++  hc.registration.sorted_lookup = yaml.get<bool>("map", "sorted_lookup", false);
++  hc.registration.reuse_geometry_linearization =
++      yaml.get<bool>("intensity", "reuse_geometry_linearization", false);
++  hc.registration.geometry_cache_recompute_jacobian =
++      yaml.get<bool>("intensity", "geometry_cache_recompute_jacobian", false);
++  hc.registration.reuse_direct_voxel_lookup =
++      yaml.get<bool>("intensity", "reuse_direct_voxel_lookup", false);
++  hc.registration.geometry_probe_enabled =
++      yaml.get<bool>("intensity", "geometry_probe_enabled", false);
++  hc.registration.geometry_probe_max_translation_m =
++      yaml.get<double>("intensity", "geometry_probe_max_translation_m", 0.05);
++  hc.registration.geometry_probe_max_rotation_deg =
++      yaml.get<double>("intensity", "geometry_probe_max_rotation_deg", 1.0);
++  hc.registration.geometry_probe_min_matches =
++      yaml.get<int>("intensity", "geometry_probe_min_matches", 100);
++  // Amortise the geometry-only solve over N scans (1 = every scan, the baseline).
++  hc.registration.geometry_anchor_period =
++      yaml.get<int>("intensity", "geometry_anchor_period", 1);
++  hc.registration.geometry_anchor_max_drift_m =
++      yaml.get<double>("intensity", "geometry_anchor_max_drift_m", 1.0);
++  // LM trial pre-screen (1 disables it).
++  hc.registration.lm_trial_stride =
++      yaml.get<int>("intensity", "lm_trial_stride", 1);
++  hc.registration.lm_prescreen_margin =
++      yaml.get<double>("intensity", "lm_prescreen_margin", -0.05);
++  hc.map_integrate_delay = yaml.get<int>("map", "integrate_delay", 0);
++  hc.pipeline_overlap = yaml.get<bool>("pipeline", "overlap", false);
++  hc.pipeline_geo_overlap = yaml.get<bool>("pipeline", "geo_overlap", false);
++  hc.pipeline_geo_rebase_translation_m =
++      yaml.get<double>("pipeline", "geo_rebase_translation_m", 0.10);
++  hc.pipeline_geo_rebase_rotation_deg =
++      yaml.get<double>("pipeline", "geo_rebase_rotation_deg", 1.0);
++  hc.pipeline_geo_threads = yaml.get<int>("pipeline", "geo_threads", 0);
++  hc.pipeline_joint_threads = yaml.get<int>("pipeline", "joint_threads", 0);
+   // The map frame is the parent (odometry) frame for published poses/clouds.
+   hc.map_frame = yaml.get<std::string>("map", "frame", hc.map_frame);
+ 
+@@ -287,8 +357,99 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
+       !config_internal::getPositive(yaml, "intensity", "num_voxels", 100, num_voxels) ||
+       !config_internal::getPositive(yaml, "intensity", "degeneracy_ratio", 10.0,
+                                     ic.degeneracy_ratio) ||
+-      !config_internal::getPositive(yaml, "intensity", "photo_scale", 0.002,
+-                                    hc.registration.photo_scale)) {
++      !config_internal::getPositive(yaml, "intensity", "photo_scale", 0.0001,
++                                    hc.registration.photo_scale) ||
++      !config_internal::getPositive(yaml, "intensity", "photo_scale_min", 0.0001,
++                                    hc.registration.photo_scale_min) ||
++      !config_internal::getPositive(yaml, "intensity", "photo_scale_max", 0.003,
++                                    hc.registration.photo_scale_max) ||
++      !config_internal::getPositive(yaml, "intensity", "photo_scale_max_alpha", 0.15,
++                                    hc.registration.photo_scale_max_alpha) ||
++      !config_internal::getPositive(yaml, "intensity", "photo_guard_fraction", 0.5,
++                                    hc.registration.photo_guard_fraction) ||
++      !config_internal::getPositive(yaml, "intensity", "photo_guard_max_alpha", 0.02,
++                                    hc.registration.photo_guard_max_alpha) ||
++      !config_internal::getPositive(yaml, "intensity", "stage_max_translation_m", 0.05,
++                                    hc.registration.stage_max_translation_m) ||
++      !config_internal::getPositive(yaml, "intensity", "stage_max_rotation_deg", 1.0,
++                                    hc.registration.stage_max_rotation_deg) ||
++      !config_internal::getPositive(yaml, "intensity", "confidence_incidence_full_deg", 55.0,
++                                    hc.registration.confidence_incidence_full_deg) ||
++      !config_internal::getPositive(yaml, "intensity", "confidence_incidence_deg", 80.0,
++                                    hc.registration.confidence_incidence_deg) ||
++      !config_internal::getPositive(yaml, "intensity", "confidence_range_full_m", 15.0,
++                                    hc.registration.confidence_range_full_m) ||
++      !config_internal::getPositive(yaml, "intensity", "confidence_range_stop_m", 30.0,
++                                    hc.registration.confidence_range_stop_m) ||
++      !config_internal::getPositive(yaml, "intensity", "incidence_scale", 0.1,
++                                    hc.registration.incidence_scale)) {
++    return false;
++  }
++  hc.registration.sequential_photo = yaml.get<bool>("intensity", "sequential_photo", false);
++  hc.registration.second_stage_mode =
++      yaml.get<std::string>("intensity", "second_stage_mode", "joint");
++  hc.registration.adaptive_photo_scale =
++      yaml.get<bool>("intensity", "adaptive_photo_scale", false);
++  hc.registration.photo_scale_mode =
++      yaml.get<std::string>("intensity", "photo_scale_mode", "continuous");
++  hc.registration.photo_window_frames =
++      yaml.get<int>("intensity", "photo_window_frames", 50);
++  hc.registration.adaptive_photo_guard =
++      yaml.get<bool>("intensity", "adaptive_photo_guard", false);
++  hc.registration.adaptive_beta = yaml.get<bool>("intensity", "adaptive_beta", false);
++  // Observability state maintained across scans (off | report | on). on skips the
++  // geometry-only solve once the state is warm; report only logs the state.
++  hc.observability_state = yaml.get<std::string>("intensity", "observability_state", "off");
++  hc.observability_alpha = yaml.get<double>("intensity", "observability_alpha", 0.25);
++  // Viewing-geometry confidence of the photometric residuals (incidence angle and range). Off by
++  // default: with it disabled the estimator is bit-identical to the baseline.
++  hc.registration.photo_confidence = yaml.get<bool>("intensity", "photo_confidence", false);
++  hc.registration.incidence_residual =
++      yaml.get<bool>("intensity", "incidence_residual", false);
++  hc.registration.confidence_in_photo_information =
++      yaml.get<bool>("intensity", "confidence_in_photo_information", true);
++  hc.registration.confidence_min = yaml.get<double>("intensity", "confidence_min", 0.0);
++  if (hc.registration.photo_scale_min > hc.registration.photo_scale_max ||
++      (hc.registration.second_stage_mode != "joint" &&
++       hc.registration.second_stage_mode != "photo_only" &&
++       hc.registration.second_stage_mode != "photo_weak_translation" &&
++       hc.registration.second_stage_mode != "joint_weak_photo") ||
++      (hc.registration.second_stage_mode != "joint" &&
++       (!hc.registration.sequential_photo || !ic.enabled)) ||
++      (hc.registration.photo_scale_mode != "continuous" &&
++       hc.registration.photo_scale_mode != "window" &&
++       hc.registration.photo_scale_mode != "discrete") ||
++      hc.registration.photo_window_frames < 2 ||
++      (hc.registration.adaptive_photo_scale &&
++       hc.registration.photo_scale_mode == "discrete" &&
++       (hc.registration.photo_scale_min > 0.0005 ||
++        hc.registration.photo_scale_max < 0.003)) ||
++      (hc.registration.adaptive_photo_scale &&
++       (hc.registration.photo_scale < hc.registration.photo_scale_min ||
++        hc.registration.photo_scale > hc.registration.photo_scale_max)) ||
++      hc.registration.photo_scale_max_alpha > 1.0 ||
++      hc.registration.photo_guard_fraction > 1.0 ||
++      hc.registration.photo_guard_max_alpha > 1.0 ||
++      hc.registration.confidence_incidence_deg <=
++          hc.registration.confidence_incidence_full_deg ||
++      hc.registration.confidence_incidence_deg > 90.0 ||
++      hc.registration.confidence_range_stop_m <= hc.registration.confidence_range_full_m ||
++      hc.registration.confidence_min < 0.0 || hc.registration.confidence_min > 1.0 ||
++      (hc.observability_state != "off" && hc.observability_state != "report" &&
++       hc.observability_state != "on") ||
++      hc.observability_alpha <= 0.0 || hc.observability_alpha > 1.0 ||
++      (hc.registration.incidence_residual && !ic.enabled) ||
++      (hc.registration.adaptive_photo_guard && !hc.registration.adaptive_photo_scale) ||
++      ((hc.registration.adaptive_photo_scale || hc.registration.adaptive_beta) &&
++       !hc.registration.sequential_photo)) {
++    LOG(E, "Config error: check intensity.second_stage_mode, photo_scale bounds, "
++               "alpha and guard fraction <= 1, "
++               "confidence_incidence_deg > confidence_incidence_full_deg, "
++               "confidence_incidence_deg <= 90, "
++               "confidence_range_stop_m > confidence_range_full_m, "
++               "confidence_min in [0, 1], "
++               "and enable sequential_photo for adaptive options; "
++               "adaptive_photo_guard also requires adaptive_photo_scale.");
+     return false;
+   }
+   ic.num_voxels = static_cast<size_t>(num_voxels);
+diff --git a/BIEVR/include/bievr_lio/ls_optimizer.h b/BIEVR/include/bievr_lio/ls_optimizer.h
+index eae44c1..339dc3e 100644
+--- a/BIEVR/include/bievr_lio/ls_optimizer.h
++++ b/BIEVR/include/bievr_lio/ls_optimizer.h
+@@ -1,7 +1,10 @@
+ #ifndef BIEVR_LIO_LS_OPTIMIZER_H_
+ #define BIEVR_LIO_LS_OPTIMIZER_H_
+ 
++#include <algorithm>
++#include <cmath>
+ #include <memory>
++#include <string>
+ 
+ #include "bievr_lio/bievr_map.h"
+ #include "bievr_lio/common.h"
+@@ -22,9 +25,99 @@ struct RegistrationConfig {
+   bool lm_debug_print = false;
+   bool img_residual = true;
+   bool img_jacobian = true;
+-  // Constant lambda that scales the photometric residuals (intensity differences in [0, 255])
+-  // to the magnitude of the geometric residuals [m].
+-  double photo_scale = 0.002;
++  // Use BIEVRMap::getVoxelSorted() instead of the hash lookup. Requires
++  // BIEVRMap::buildSortedIndex() to have run since the last map mutation; the
++  // lookup falls back to the hash path automatically when the index is stale.
++  bool sorted_lookup = false;
++  // Accumulate the geometric and photometric information into separate 6x6 blocks
++  // during the joint linearization. Two extra matrices per thread; lets a single
++  // solve report H_geo and H_photo instead of running modality-only solves.
++  bool split_information = false;
++  // Reuse the geometric Jacobian captured at another pose of the same scan. The map
++  // does not change between the two solves, so the correspondence and J stay valid
++  // while the pose stays close; the residual is still evaluated exactly at the trial
++  // pose. Stage 1 of the geometry-cache experiment.
++  bool reuse_geometry_linearization = false;
++  // Keep the cache lookup and its statistics but always recompute the Jacobian.
++  // Control condition for the experiment: if this is as fast as full reuse, the
++  // saving is not in the Jacobian.
++  bool geometry_cache_recompute_jacobian = false;
++  // Reuse a direct voxel hit from the geometry stage when the point remains in
++  // the same voxel on the unchanged map. The residual and Jacobian are recomputed.
++  bool reuse_direct_voxel_lookup = false;
++  // One linearization at the IMU pose decides whether geometry LM is needed.
++  bool geometry_probe_enabled = false;
++  double geometry_probe_max_translation_m = 0.05;
++  double geometry_probe_max_rotation_deg = 1.0;
++  int geometry_probe_min_matches = 100;
++  // Re-run the geometry-only solve at most once every N scans. Between anchors the
++  // last geometry pose and information matrix are reused, advanced by the IMU
++  // prediction; 1 keeps the per-scan solve (baseline). The geometry stage supplies
++  // a start pose and a weak-direction prior, both of which change slowly compared
++  // with the scan rate, so the solve can be amortised over a few scans.
++  int geometry_anchor_period = 1;
++  // Force an early re-anchor once the scan has moved this far from the anchor pose,
++  // so a fast manoeuvre cannot accumulate error between anchors.
++  double geometry_anchor_max_drift_m = 1.0;
++  // Photometric residual scale (intensity differences to geometric residual units).
++  // When adaptive_photo_scale is enabled, this is the initial value.
++  double photo_scale = 0.0001;
++  // Experimental geometry prealignment followed by joint refinement.
++  bool sequential_photo = false;
++  // joint | photo_only | photo_weak_translation | joint_weak_photo.
++  std::string second_stage_mode = "joint";
++  bool adaptive_photo_scale = false;
++  // continuous: per-scan information candidate; window: median candidate per
++  // fixed scan window; discrete: geometric weak-direction count selects a level.
++  std::string photo_scale_mode = "continuous";
++  int photo_window_frames = 50;
++  // LM trial pre-screen. With stride > 1 the cost of a trial step is first
++  // evaluated on every stride-th point; when that subsample says the step is
++  // clearly worse the step is rejected without a full pass. Accepted steps are
++  // always evaluated on the full cloud, so the convergence path is unchanged.
++  // 1 disables the pre-screen.
++  int lm_trial_stride = 1;
++  // Relative-cost margin the subsample must fall below before rejecting.
++  double lm_prescreen_margin = -0.05;
++  // Experimental high-side target from current translation information.
++  // The applied scale moves toward it gradually, including on IMU starts.
++  bool adaptive_photo_guard = false;
++  double photo_guard_fraction = 0.5;
++  double photo_guard_max_alpha = 0.02;
++  double photo_scale_min = 0.0001;
++  double photo_scale_max = 0.003;
++  double photo_scale_max_alpha = 0.15;
++  bool adaptive_beta = false;
++  // Maximum deviation of geometry prealignment from the IMU prediction before
++  // joint optimization is instead initialized from that prediction.
++  double stage_max_translation_m = 0.05;
++  double stage_max_rotation_deg = 1.0;
++  // Photometric confidence from the viewing geometry. A map pixel was written from a different
++  // range and incidence angle than the current return, so part of every intensity difference is
++  // geometric rather than reflectance. When enabled, each photometric residual is weighted by
++  //   c = ramp(cos(incidence); cos(full)..cos(cut)) * ramp(range; full..stop),
++  // clamped from below by `confidence_min`. The weight scales the residual and its Jacobian, so
++  // the cost contribution scales with c. It is an observation weight only: the adaptive scale
++  // lambda and its update rule are untouched.
++  bool photo_confidence = false;
++  double confidence_incidence_full_deg = 55.0;
++  double confidence_incidence_deg = 80.0;
++  double confidence_range_full_m = 15.0;
++  double confidence_range_stop_m = 30.0;
++  double confidence_min = 0.0;
++  // Whether the confidence also shapes the photometric information matrix that the adaptive scale
++  // is estimated from. False keeps that estimate unweighted, i.e. freezes lambda's input.
++  bool confidence_in_photo_information = true;
++  // Independent source-scan normal versus mapped voxel-plane incidence.
++  bool incidence_residual = false;
++  double incidence_scale = 0.1;  // residual metres per unit cosine difference
++};
++
++enum class RegistrationMode { Joint, GeometryOnly, PhotoOnly };
++
++struct RegistrationResiduals {
++  std::vector<double> geometry;
++  std::vector<double> photo;  // Unscaled intensity differences.
+ };
+ 
+ // Bilinear sample of a voxel image `M` at the pixel coordinates (x, y), using only the pixels
+@@ -164,24 +257,115 @@ inline bool sampleValueAndGradient(const Voxel* voxel, const double x, const dou
+                                 dIdy);
+ }
+ 
++// Confidence [0, 1] that an intensity difference between a source point at `p_W` and the map is
++// caused by the pose rather than by the viewing geometry.
++//
++// LiDAR brightness falls off with the incidence angle (cosine law) and with range. A map pixel was
++// written from a different viewpoint than the current return, so the raw difference
++// `intensity_j - I_map` mixes a reflectance change (the signal of interest) with a geometric one
++// (a nuisance). The weight removes the nuisance: full weight at near-normal incidence and inside
++// `confidence_range_full_m`, decreasing linearly to zero at `confidence_incidence_deg` and
++// `confidence_range_stop_m`, and never below `confidence_min`.
++inline double photoConfidence(const RegistrationConfig& config, const Voxel& voxel, const V3& p_W,
++                              const V3& origin_W) {
++  if (!config.photo_confidence) return 1.0;
++
++  const V3 ray = p_W - origin_W;
++  const double range = ray.norm();
++  if (!std::isfinite(range) || range <= 1e-6) return 0.0;
++
++  constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
++  const double cos_full = std::cos(config.confidence_incidence_full_deg * kDegToRad);
++  const double cos_cut = std::cos(config.confidence_incidence_deg * kDegToRad);
++  // Row 2 of T_C_W is the surface normal expressed in the world frame.
++  const V3 normal = voxel.T_C_W_.linear().row(2).transpose();
++  const double cos_incidence = std::abs(normal.dot(ray / range));
++
++  double confidence_incidence = 1.0;
++  if (cos_cut < cos_full) {
++    confidence_incidence =
++        std::clamp((cos_incidence - cos_cut) / (cos_full - cos_cut), 0.0, 1.0);
++  }
++  double confidence_range = 1.0;
++  if (config.confidence_range_stop_m > config.confidence_range_full_m) {
++    confidence_range = std::clamp((config.confidence_range_stop_m - range) /
++                                      (config.confidence_range_stop_m -
++                                       config.confidence_range_full_m),
++                                  0.0, 1.0);
++  }
++  return std::max(config.confidence_min, confidence_incidence * confidence_range);
++}
++
+ struct Accumulator {
+   int count = 0;
+   int photo_count = 0;  // number of photometric residuals (not included in count)
++  int incidence_count = 0;
++  // Sum and count of the viewing-geometry confidence over the photometric points, for reporting.
++  double photo_confidence_sum = 0.0;
++  int photo_confidence_count = 0;
++  int photo_confidence_zero = 0;
+   double error_sum = 0.0;
+   Matrix66 H = Matrix66::Zero();
+   Vector6 b = Vector6::Zero();
+   double huber_delta = 0.2;  // default delta
+ 
++  // When set, the geometric and photometric contributions are also accumulated into
++  // H_geo/H_photo, so one joint linearization yields both modality blocks.
++  bool split = false;
++  Matrix66 H_geo = Matrix66::Zero();
++  Vector6 b_geo = Vector6::Zero();
++  Matrix66 H_photo = Matrix66::Zero();
++  Vector6 b_photo = Vector6::Zero();
++  // Cache statistics, accumulated per thread and merged with the reduce.
++  int reused_geometry_count = 0;
++  int geometry_cache_misses = 0;
++  int direct_voxel_lookup_hits = 0;
++
+   inline void add(double r, const Row6* J) {
+     ++count;
+-    addResidual(r, J);
++    if (split) {
++      addResidualSplit(r, J, &H_geo, &b_geo);
++    } else {
++      addResidual(r, J);
++    }
+   }
+ 
+   inline void addPhotometric(double r, const Row6* J) {
+     ++photo_count;
++    if (split) {
++      addResidualSplit(r, J, &H_photo, &b_photo);
++    } else {
++      addResidual(r, J);
++    }
++  }
++
++  inline void addIncidence(double r, const Row6* J) {
++    ++incidence_count;
+     addResidual(r, J);
+   }
+ 
++  // Same accumulation as addResidual(), plus the same contribution into the given
++  // block. Keeping the two modality blocks separate costs two extra 6x6 matrices
++  // and lets the caller read the geometric and photometric information of this
++  // linearization directly, instead of running a second, modality-only solve.
++  inline void addResidualSplit(double r, const Row6* J, Matrix66* block_H, Vector6* block_b) {
++    double abs_r = std::abs(r);
++    bool inlier = abs_r <= huber_delta;
++    double w = inlier ? 1.0 : huber_delta / abs_r;
++
++    error_sum += inlier ? 0.5 * r * r : huber_delta * (abs_r - 0.5 * huber_delta);
++
++    if (J) {
++      const Vector6 wJ = w * J->transpose();
++      const Matrix66 JtJ = wJ * (*J);
++      const Vector6 Jtr = wJ * r;
++      H.noalias() += JtJ;
++      b.noalias() += Jtr;
++      if (block_H) block_H->noalias() += JtJ;
++      if (block_b) block_b->noalias() += Jtr;
++    }
++  }
++
+   inline void addResidual(double r, const Row6* J) {
+     double abs_r = std::abs(r);
+     bool inlier = abs_r <= huber_delta;
+@@ -199,9 +383,22 @@ struct Accumulator {
+   inline void merge(const Accumulator& other) {
+     count += other.count;
+     photo_count += other.photo_count;
++    incidence_count += other.incidence_count;
++    photo_confidence_sum += other.photo_confidence_sum;
++    photo_confidence_count += other.photo_confidence_count;
++    photo_confidence_zero += other.photo_confidence_zero;
+     error_sum += other.error_sum;
+     H += other.H;
+     b += other.b;
++    reused_geometry_count += other.reused_geometry_count;
++    geometry_cache_misses += other.geometry_cache_misses;
++    direct_voxel_lookup_hits += other.direct_voxel_lookup_hits;
++    if (split) {
++      H_geo += other.H_geo;
++      b_geo += other.b_geo;
++      H_photo += other.H_photo;
++      b_photo += other.b_photo;
++    }
+   }
+ };
+ 
+@@ -214,10 +411,24 @@ class LsqRegistration {
+   // geometric residual.
+   LsqRegistration(const BIEVRMap& map, const Pointcloud& source,
+                   const RegistrationConfig& config = RegistrationConfig(),
+-                  const std::vector<double>* intensities = nullptr);
++                  const std::vector<double>* intensities = nullptr,
++                  RegistrationMode mode = RegistrationMode::Joint);
+   virtual ~LsqRegistration() = default;
+ 
+   Transform computeTransformation(const Transform& T_W_L_init);
++  // Restrict a PhotoOnly solve to a fixed translation subspace in the local
++  // LiDAR frame. The projector must be symmetric and idempotent.
++  void setTranslationProjector(const Eigen::Matrix3d& projector);
++  // Freeze per-point photometric weights at the geometry pose. Returns the
++  // number of selected intensity correspondences.
++  int setWeakPhotoWeights(const Transform& T_W_L,
++                          const Eigen::Matrix3d& weak_projector);
++  // Evaluate viewing confidence once at the registration start. Its per-point
++  // value stays fixed throughout this scan's LM iterations.
++  void freezePhotoConfidence(const Transform& T_W_L);
++  void setSourceNormals(const std::vector<V3>* normals) { source_normals_j_ = normals; }
++  int numIncidencePoints() const { return num_incidence_points_; }
++  double meanWeakPhotoWeight() const { return mean_weak_photo_weight_; }
+ 
+   // Number of source points that found a valid map correspondence in the last
+   // linearization with Jacobians (i.e. the points that actually constrained the
+@@ -227,10 +438,65 @@ class LsqRegistration {
+   // Number of photometric residuals in the last linearization with Jacobians.
+   int numPhotometricPoints() const { return num_photometric_points_; }
+ 
++  // Mean viewing-geometry confidence of the photometric correspondences of the last
++  // linearization, and how many of them were weighted to zero. With the confidence disabled the
++  // mean is 1 and the zero count is 0.
++  double meanPhotoConfidence() const { return mean_photo_confidence_; }
++  int numPhotoConfidenceZero() const { return num_photo_confidence_zero_; }
++
++  // Evaluate the same map correspondences used by the optimizer at a fixed pose.
++  RegistrationResiduals collectResiduals(const Transform& T_W_L) const;
++
++  // Geometry-only normal matrix at the converged geometry pose.
++  Matrix66 informationAt(const Transform& T_W_L);
++  double linearizationAt(const Transform& T_W_L, Matrix66& H, Vector6& b);
++
++  // Modality blocks of the last linearization with Jacobians, filled only when
++  // `split_information` is set. H_geo + H_photo equals the full H of that pass.
++  const Matrix66& geometryInformation() const { return H_geo_; }
++  const Matrix66& photometricInformation() const { return H_photo_; }
++
++  // Geometric linearization captured at one pose and reused at another pose of the
++  // same scan. Only the Jacobian and the voxel correspondence are stored; the
++  // residual is re-evaluated at every trial pose, so the objective stays exact and
++  // only its linearization is recycled.
++  struct GeometryCacheEntry {
++    const Voxel* voxel = nullptr;
++    Row6 J = Row6::Zero();
++    size_t direct_hash = 0;
++    bool direct_lookup = false;
++  };
++  void captureGeometryLinearization() { capture_geometry_ = true; }
++  bool hasGeometryLinearization() const { return !geo_cache_.empty(); }
++  int reusedGeometryPoints() const { return reused_points_; }
++  int geometryCacheMisses() const { return cache_misses_; }
++  int directVoxelLookupHits() const { return direct_voxel_lookup_hits_; }
++  double geometryCacheDeltaT() const { return cache_delta_t_; }
++  double geometryCacheDeltaR() const { return cache_delta_r_; }
++  void adoptGeometryLinearization(const LsqRegistration& other) {
++    geo_cache_ = other.geo_cache_;
++    cache_pose_ = other.cache_pose_;
++  }
++  // Pass accounting for the timing experiments: how many point-set traversals
++  // the last solve needed, split into the ones that build H/b and the trial
++  // evaluations, plus the LM steps that were rejected and recomputed.
++  int jacobianPasses() const { return jacobian_passes_; }
++  int trialPasses() const { return trial_passes_; }
++  int rejectedSteps() const { return rejected_steps_; }
++  int prescreenPasses() const { return prescreen_passes_; }
++  int linearizeCalls() const { return jacobian_passes_ + trial_passes_; }
++
+  private:
++  // Voxel of one source point, with the nearest-voxel fallback. Uses the sorted
++  // index when the map has a valid one, the hash otherwise.
++  const Voxel* findVoxel(const V3& p_W, size_t& hash_idx) const;
++
++  void prepareSkewPoints();
+   bool isConverged(const Transform& delta) const;
+ 
+-  double linearize(const Transform& T_W_L, Matrix66* H = nullptr, Vector6* b = nullptr);
++  // stride > 1 walks every stride-th point; only meaningful for the cost-only path.
++  double linearize(const Transform& T_W_L, Matrix66* H = nullptr, Vector6* b = nullptr,
++                   int stride = 1);
+ 
+   bool stepLm(Transform& x0, Transform& delta);
+ 
+@@ -239,11 +505,35 @@ class LsqRegistration {
+   const BIEVRMap& map_;
+   const Pointcloud& points_j_;
+   const std::vector<double>* intensities_j_ = nullptr;
++  const std::vector<V3>* source_normals_j_ = nullptr;
++  RegistrationMode mode_ = RegistrationMode::Joint;
++  Matrix66 step_projector_ = Matrix66::Identity();
++  std::vector<double> weak_photo_weights_;
++  std::vector<double> frozen_photo_confidence_;
++  double mean_weak_photo_weight_ = 0.0;
+   std::vector<M3> skew_points_j_;
+   bool converged_ = false;
++  // Point-set traversals of this solver instance, for the timing experiments.
++  int jacobian_passes_ = 0;
++  int trial_passes_ = 0;
++  int rejected_steps_ = 0;
++  int prescreen_passes_ = 0;
+   int num_effective_points_ = 0;
+   int num_photometric_points_ = 0;
++  int num_incidence_points_ = 0;
++  double mean_photo_confidence_ = 1.0;
++  int num_photo_confidence_zero_ = 0;
++  Matrix66 H_geo_ = Matrix66::Zero();
++  Matrix66 H_photo_ = Matrix66::Zero();
++  std::vector<GeometryCacheEntry> geo_cache_;
++  bool capture_geometry_ = false;
++  int reused_points_ = 0;
++  int cache_misses_ = 0;
++  int direct_voxel_lookup_hits_ = 0;
++  Transform cache_pose_ = Transform::Identity();
++  double cache_delta_t_ = 0.0;
++  double cache_delta_r_ = 0.0;
+ };
+ 
+ }  // namespace bievr
+-#endif  // BIEVR_LIO_LS_OPTIMIZER_H_
+\ No newline at end of file
++#endif  // BIEVR_LIO_LS_OPTIMIZER_H_
+diff --git a/BIEVR/include/bievr_lio/pipeline.h b/BIEVR/include/bievr_lio/pipeline.h
+index 9a4e4fe..a8212c0 100644
+--- a/BIEVR/include/bievr_lio/pipeline.h
++++ b/BIEVR/include/bievr_lio/pipeline.h
+@@ -1,7 +1,12 @@
+ #ifndef BIEVR_LIO_PIPELINE_H_
+ #define BIEVR_LIO_PIPELINE_H_
+ 
++#include <chrono>
+ #include <typeindex>
++#include <vector>
++#include <optional>
++#include <shared_mutex>
++#include <tbb/task_arena.h>
+ 
+ #include "bievr_lio/bievr_map.h"
+ #include "bievr_lio/imu_integrator.h"
+@@ -37,10 +42,38 @@ class Pipeline {
+ 
+     size_t min_points_for_map_init = 100;
+     size_t map_size_running_threshold = 5;
++    // 0 = integrate each scan at the end of its own frame (default).
++    // 1 = integrate it one frame later, so registration runs against a map
++    //     that does not contain the previous scan yet.
++    int map_integrate_delay = 0;
++    // Overlap only scan-local intensity/range preprocessing with the previous
++    // frame's stateful registration. All state and map work remains serial.
++    bool pipeline_overlap = false;
++    bool pipeline_geo_overlap = false;
++    double pipeline_geo_rebase_translation_m = 0.10;
++    double pipeline_geo_rebase_rotation_deg = 1.0;
++    int pipeline_geo_threads = 0;    // 0: unrestricted; positive: per-stage arena limit
++    int pipeline_joint_threads = 0;
+     size_t informed_sample_count = 300;
+     size_t min_map_size_for_imu_opt = 100;
+     size_t min_imu_integrators_for_opt = 5;
+     double gravity_prior_weight = 5.0;
++    // "off": never maintain the state, behaviour is unchanged.
++    // "report": maintain it and log it next to the geometry solve (no behaviour change).
++    // "on": skip the geometry-only solve once the state is warm.
++    std::string observability_state = "off";
++    double observability_alpha = 0.25;
++  };
++
++  // Geometric information carried from the previous scans. The joint solve already
++  // accumulates H_geo/H_photo per point when `split_information` is on, so updating
++  // this costs two 6x6 linear combinations per scan, not another point-set pass.
++  struct ObservabilityState {
++    Matrix66 H_geo = Matrix66::Zero();
++    Matrix66 H_photo = Matrix66::Zero();
++    size_t geometry_points = 0;
++    size_t frames = 0;
++    bool valid() const { return frames >= 3 && geometry_points >= 100; }
+   };
+ 
+   explicit Pipeline(const Config& config);
+@@ -52,7 +85,7 @@ class Pipeline {
+   // Writes the map to Config::map_path as a binary PCD (x, y, z, intensity): one point per valid
+   // pixel, lifted onto the voxel surface, with the value of the intensity map (0 where the pixel
+   // has no intensity). Does nothing if no path is configured.
+-  bool saveMap() const;
++  bool saveMap();
+ 
+   template <typename T>
+   void registerPublisher(std::function<void(const T&, const Header&, const std::string& topic,
+@@ -68,6 +101,52 @@ class Pipeline {
+  private:
+   enum class Phase { NeedBias, NeedMap, Running };
+ 
++  struct PreparedFrame {
++    std::vector<ImuMeasurement> imu;
++    StampedIntensityPointcloud filtered_L;
++    Pointcloud filtered_I;
++    bool pipeline_anchor_requested = false;
++  };
++  struct GeometryPrefetch {
++    Transform predicted = Transform::Identity();
++    Transform geometry = Transform::Identity();
++    Matrix66 information = Matrix66::Zero();
++    State provisional_end{};
++    int matches = 0;
++    double solve_ms = 0.0;
++    double prep_ms = 0.0;
++    int64_t begin_ns = 0;
++    int64_t end_ns = 0;
++    int64_t solve_begin_ns = 0;
++    int64_t solve_end_ns = 0;
++    uint64_t stamp = 0;
++    bool attempted = false;
++    bool valid = false;
++  };
++  PreparedFrame prepareFrame(const std::vector<ImuMeasurement>& imu_data,
++                             const StampedIntensityPointcloud& points_L);
++  GeometryPrefetch prefetchGeometry(const PreparedFrame& frame, const State& prior,
++                                   const V3& acc_bias, const V3& gyro_bias,
++                                   const V3& gravity_dir, double imu_scale,
++                                   bool solve_geometry);
++  void processPreparedFrame(const PreparedFrame& frame,
++                            const GeometryPrefetch* prefetched = nullptr);
++  void flushPendingFrame();
++  std::optional<PreparedFrame> pending_frame_;
++  std::optional<GeometryPrefetch> pending_geometry_;
++  mutable std::shared_mutex pipeline_map_mutex_;
++  std::unique_ptr<tbb::task_arena> pipeline_geo_arena_;
++  std::unique_ptr<tbb::task_arena> pipeline_joint_arena_;
++  size_t pipeline_geo_reused_ = 0;
++  size_t pipeline_geo_redone_ = 0;
++  size_t pipeline_geo_attempted_ = 0;
++  size_t pipeline_geo_skipped_ = 0;
++  size_t geometry_probe_frames_ = 0;
++  size_t geometry_probe_skipped_ = 0;
++  size_t pipeline_frames_enqueued_ = 0;
++  size_t pipeline_calls_ = 0;
++  double pipeline_call_ms_sum_ = 0.0;
++
+   // Pipeline helpers
+   bool initializeBias(const std::vector<ImuMeasurement>& imu_data, const Pointcloud& pointcloud,
+                       const IntensityView& intensities);
+@@ -129,6 +208,32 @@ class Pipeline {
+   std::unique_ptr<BiasInitializer> bias_initializer_;
+   std::unique_ptr<IntensityProcessor> intensity_processor_;
+   std::shared_ptr<BIEVRMap> map_;
++  // Persisted between scans; initialized from intensity.photo_scale.
++  double photo_scale_ = 0.002;
++  // Maintained when config_.observability_state != "off".
++  ObservabilityState observability_;
++  // Geometry re-anchor state (intensity.geometry_anchor_period > 1). The geometry
++  // solve runs on an anchor scan; between anchors its pose and information matrix
++  // are reused, with the pose advanced by the IMU prediction of the current scan.
++  Transform T_geometry_anchor_ = Transform::Identity();
++  Matrix66 H_geometry_anchor_ = Matrix66::Zero();
++  int geometry_matches_anchor_ = 0;
++  int frames_since_anchor_ = 0;
++  bool geometry_anchor_valid_ = false;
++  // One-frame map lag: the registered scan is buffered here and integrated at
++  // the end of the next frame.
++  bool map_lag_pending_ = false;
++  Pointcloud map_lag_points_;
++  std::vector<double> map_lag_ranges_;
++  Intensities map_lag_intensities_;
++  void updateObservability(const Matrix66& H_geo, const Matrix66& H_photo, int points);
++  std::vector<double> photo_window_candidates_;
++  size_t photo_window_scans_ = 0;
++  int discrete_target_level_ = 0;
++  int pending_discrete_level_ = -1;
++  int pending_discrete_count_ = 0;
++  size_t geometry_starts_ = 0;
++  size_t registration_attempts_ = 0;
+   V3 acc_bias_ = V3::Zero();
+   V3 gyro_bias_ = V3::Zero();
+   V3 gravity_dir_ = V3(0, 0, 1);
+diff --git a/BIEVR/src/bievr_map.cpp b/BIEVR/src/bievr_map.cpp
+index 97e8246..e5cc63d 100644
+--- a/BIEVR/src/bievr_map.cpp
++++ b/BIEVR/src/bievr_map.cpp
+@@ -3,6 +3,8 @@
+ #include <Eigen/Eigenvalues>
+ #include <algorithm>
+ #include <cmath>
++#include <cstdint>
++#include <numeric>
+ #include <utility>
+ #include <vector>
+ 
+@@ -43,6 +45,9 @@ BIEVRMap::BIEVRMap(Config config) : config_(config) {
+ 
+ bool BIEVRMap::integratePoints(const Pointcloud& cloud, const std::vector<double>* ranges,
+                                const IntensityView* intensities) {
++  // Any insert/erase invalidates the sorted index built by a previous scan.
++  ++mutation_stamp_;
++
+   if (cloud.empty()) {
+     LOG(I, "No points in cloud to map.");
+     return false;
+@@ -462,6 +467,45 @@ const Voxel* BIEVRMap::getVoxel(size_t hash_idx) const {
+   return nullptr;
+ }
+ 
++void BIEVRMap::buildSortedIndex() const {
++  sorted_keys_.clear();
++  sorted_voxels_.clear();
++  sorted_keys_.reserve(map_.size());
++  sorted_voxels_.reserve(map_.size());
++
++  for (const auto& entry : map_) {
++    if (!entry.second.voxel.observed_) continue;
++    sorted_keys_.push_back(static_cast<uint64_t>(entry.first));
++    sorted_voxels_.push_back(&entry.second.voxel);
++  }
++
++  // Sort through a permutation so the two arrays stay aligned, and swap at the end
++  // so a concurrent reader never sees a half-sorted pair.
++  const size_t n = sorted_keys_.size();
++  std::vector<uint32_t> order(n);
++  std::iota(order.begin(), order.end(), 0u);
++  const std::vector<uint64_t>& keys = sorted_keys_;
++  tbb::parallel_sort(order.begin(), order.end(),
++                     [&keys](uint32_t a, uint32_t b) { return keys[a] < keys[b]; });
++
++  std::vector<uint64_t> sorted_keys(n);
++  std::vector<const Voxel*> sorted_voxels(n);
++  for (size_t i = 0; i < n; ++i) {
++    sorted_keys[i] = sorted_keys_[order[i]];
++    sorted_voxels[i] = sorted_voxels_[order[i]];
++  }
++  sorted_keys_.swap(sorted_keys);
++  sorted_voxels_.swap(sorted_voxels);
++  sorted_stamp_ = mutation_stamp_;
++}
++
++const Voxel* BIEVRMap::getVoxelSorted(const uint64_t key) const {
++  if (sorted_stamp_ != mutation_stamp_ || sorted_keys_.empty()) return nullptr;
++  const auto it = std::lower_bound(sorted_keys_.begin(), sorted_keys_.end(), key);
++  if (it == sorted_keys_.end() || *it != key) return nullptr;
++  return sorted_voxels_[static_cast<size_t>(it - sorted_keys_.begin())];
++}
++
+ Eigen::Vector3i BIEVRMap::getVoxelIdx(const Eigen::Vector3d& point) const {
+   Eigen::Vector3i idx;
+   idx(0) = floor(point.x() * inv_voxel_size_);
+diff --git a/BIEVR/src/ls_optimizer.cpp b/BIEVR/src/ls_optimizer.cpp
+index 036c1a4..38aa64f 100644
+--- a/BIEVR/src/ls_optimizer.cpp
++++ b/BIEVR/src/ls_optimizer.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include "bievr_lio/ls_optimizer.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include <tbb/enumerable_thread_specific.h>
+ #include <tbb/parallel_reduce.h>
+ 
+@@ -13,19 +16,140 @@ namespace bievr {
+ 
+ LsqRegistration::LsqRegistration(const BIEVRMap& map, const Pointcloud& source,
+                                  const RegistrationConfig& config,
+-                                 const std::vector<double>* intensities)
+-    : config_(config), map_(map), points_j_(source), intensities_j_(intensities) {}
++                                 const std::vector<double>* intensities, RegistrationMode mode)
++    : config_(config), map_(map), points_j_(source), intensities_j_(intensities), mode_(mode) {}
++
++void LsqRegistration::setTranslationProjector(const Eigen::Matrix3d& projector) {
++  step_projector_.setZero();
++  step_projector_.block<3, 3>(3, 3) = projector;
++}
++
++void LsqRegistration::freezePhotoConfidence(const Transform& T_W_L) {
++  frozen_photo_confidence_.clear();
++  if (!config_.photo_confidence || !intensities_j_) return;
++  frozen_photo_confidence_.assign(points_j_.size(), 0.0);
++  for (size_t i = 0; i < points_j_.size(); ++i) {
++    if ((*intensities_j_)[i] < 0.0) continue;
++    const Point p_W = T_W_L * points_j_[i];
++    size_t hash = 0;
++    const Voxel* voxel = findVoxel(p_W, hash);
++    if (!voxel) continue;
++    if (voxel->intensity_weights_.size() == 0) continue;
++    frozen_photo_confidence_[i] =
++        photoConfidence(config_, *voxel, p_W, T_W_L.translation());
++  }
++}
++
++int LsqRegistration::setWeakPhotoWeights(const Transform& T_W_L,
++                                         const Eigen::Matrix3d& weak_projector) {
++  weak_photo_weights_.assign(points_j_.size(), 0.0);
++  mean_weak_photo_weight_ = 0.0;
++  if (!intensities_j_) return 0;
++  int selected = 0;
++  for (size_t i = 0; i < points_j_.size(); ++i) {
++    if ((*intensities_j_)[i] < 0.0) continue;
++    const Point p_W = T_W_L * points_j_[i];
++    size_t hash = 0;
++    const Voxel* voxel = findVoxel(p_W, hash);
++    if (!voxel) continue;
++    if (voxel->intensity_weights_.size() == 0) continue;
++    const Point p_o = voxel->T_C_W_ * p_W;
++    const double x = p_o.x() * map_.inv_px_size;
++    const double y = p_o.y() * map_.inv_px_size;
++    double value = 0.0, dx = 0.0, dy = 0.0;
++    if (!sampleValueAndGradient(voxel->intensity_smoothed_,
++                                voxel->intensity_weights_, x, y, value, dx, dy))
++      continue;
++    const Eigen::RowVector3d j_t =
++        -(Eigen::RowVector2d(dx, dy) *
++          (voxel->T_C_W_.linear() * T_W_L.linear()).topRows<2>()) *
++        map_.inv_px_size;
++    const double total = j_t.squaredNorm();
++    if (!std::isfinite(total) || total <= 1e-12) continue;
++    const double quality =
++        std::clamp((j_t * weak_projector).squaredNorm() / total, 0.0, 1.0);
++    if (!std::isfinite(quality) || quality < 0.25) continue;
++    // Exclude low-confidence points from the 30-point stage gate. Store only
++    // directional quality here; linearize() applies confidence exactly once.
++    const double confidence = frozen_photo_confidence_.empty()
++                                  ? photoConfidence(config_, *voxel, p_W,
++                                                    T_W_L.translation())
++                                  : frozen_photo_confidence_[i];
++    if (config_.photo_confidence && confidence < 0.25) {
++      continue;
++    }
++    weak_photo_weights_[i] = quality;
++    mean_weak_photo_weight_ += quality;
++    ++selected;
++  }
++  if (selected > 0) mean_weak_photo_weight_ /= selected;
++  return selected;
++}
++
++Matrix66 LsqRegistration::informationAt(const Transform& T_W_L) {
++  prepareSkewPoints();
++  Matrix66 H;
++  Vector6 b;
++  linearize(T_W_L, &H, &b);
++  return H;
++}
++
++double LsqRegistration::linearizationAt(const Transform& T_W_L, Matrix66& H, Vector6& b) {
++  prepareSkewPoints();
++  return linearize(T_W_L, &H, &b);
++}
++
++RegistrationResiduals LsqRegistration::collectResiduals(const Transform& T_W_L) const {
++  RegistrationResiduals result;
++  result.geometry.reserve(points_j_.size());
++  if (intensities_j_) result.photo.reserve(points_j_.size());
++
++  for (size_t i = 0; i < points_j_.size(); ++i) {
++    const Point p_W = T_W_L * points_j_[i];
++    size_t hash = 0;
++    const Voxel* voxel = findVoxel(p_W, hash);
++    if (!voxel) continue;
++
++    const Point p_o = voxel->T_C_W_ * p_W;
++    const double x = p_o.x() * map_.inv_px_size;
++    const double y = p_o.y() * map_.inv_px_size;
++    double map_height = 0.0;
++    if ((!config_.img_residual || getSubPixelValue(voxel, x, y, map_height)) &&
++        std::isfinite(p_o.z() - map_height)) {
++      result.geometry.push_back(p_o.z() - map_height);
++    }
++
++    if (!intensities_j_ || (*intensities_j_)[i] < 0.0 ||
++        voxel->intensity_weights_.size() == 0) {
++      continue;
++    }
++    double map_intensity = 0.0;
++    if (getSubPixelValue(voxel->intensity_smoothed_, voxel->intensity_weights_, x, y,
++                         map_intensity)) {
++      const double r = (*intensities_j_)[i] - map_intensity;
++      if (std::isfinite(r)) result.photo.push_back(r);
++    }
++  }
++  return result;
++}
++
++const Voxel* LsqRegistration::findVoxel(const V3& p_W, size_t& hash_idx) const {
++  hash_idx = map_.hashIndex(p_W);
++  const bool sorted = config_.sorted_lookup && map_.sortedIndexValid();
++  if (sorted) {
++    if (const Voxel* voxel = map_.getVoxelSorted(static_cast<uint64_t>(hash_idx))) return voxel;
++  } else if (const Voxel* voxel = map_.getVoxel(hash_idx)) {
++    return voxel;
++  }
++  // Miss: search the 27 neighbours, then reuse the same backend for the new key.
++  if (!map_.nearestVoxel(p_W, hash_idx)) return nullptr;
++  return sorted ? map_.getVoxelSorted(static_cast<uint64_t>(hash_idx)) : map_.getVoxel(hash_idx);
++}
+ 
+ Transform LsqRegistration::computeTransformation(const Transform& T_W_L_init) {
+   Transform x0 = T_W_L_init;
+ 
+-  skew_points_j_.resize(points_j_.size());
+-  tbb::parallel_for(tbb::blocked_range<size_t>(0, points_j_.size()),
+-                    [&](const tbb::blocked_range<size_t>& r) {
+-                      for (size_t i = r.begin(); i != r.end(); ++i) {
+-                        skew_points_j_[i] = skew(points_j_[i]);
+-                      }
+-                    });
++  prepareSkewPoints();
+ 
+   if (config_.lm_debug_print) {
+     LOG(I, "***************** optimize *****************");
+@@ -43,6 +167,17 @@ Transform LsqRegistration::computeTransformation(const Transform& T_W_L_init) {
+   return x0;
+ }
+ 
++void LsqRegistration::prepareSkewPoints() {
++  if (skew_points_j_.size() == points_j_.size()) return;
++  skew_points_j_.resize(points_j_.size());
++  tbb::parallel_for(tbb::blocked_range<size_t>(0, points_j_.size()),
++                    [&](const tbb::blocked_range<size_t>& r) {
++                      for (size_t i = r.begin(); i != r.end(); ++i) {
++                        skew_points_j_[i] = skew(points_j_[i]);
++                      }
++                    });
++}
++
+ bool LsqRegistration::isConverged(const Transform& delta) const {
+   Eigen::Matrix3d R = delta.linear() - Eigen::Matrix3d::Identity();
+   Eigen::Vector3d t = delta.translation();
+@@ -53,25 +188,57 @@ bool LsqRegistration::isConverged(const Transform& delta) const {
+   return std::max(r_delta.maxCoeff(), t_delta.maxCoeff()) < 1;
+ }
+ 
+-double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6* b) {
++double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6* b,
++                                  int stride) {
+   const bool compute_jacobians = (H != nullptr && b != nullptr);
++  if (compute_jacobians) {
++    ++jacobian_passes_;
++  } else {
++    ++trial_passes_;
++  }
++
++  // The cache is indexed by source point, so it is only valid for this point set.
++  if (capture_geometry_ && geo_cache_.size() != points_j_.size()) {
++    geo_cache_.assign(points_j_.size(), GeometryCacheEntry());
++  }
++  bool reuse = config_.reuse_geometry_linearization && compute_jacobians &&
++               geo_cache_.size() == points_j_.size();
++  if (reuse) {
++    reused_points_ = 0;
++    cache_misses_ = 0;
++    // Pose offset relative to the capture pose, in the same (right-multiplied)
++    // tangent convention as the step, so it can be compared with the reuse gate.
++    const Transform D = cache_pose_.inverse() * T_W_L;
++    cache_delta_t_ = D.translation().norm();
++    cache_delta_r_ = Eigen::AngleAxisd(D.linear()).angle();
++    reuse = cache_delta_t_ <= 0.02 &&
++            cache_delta_r_ <= 0.2 * 3.141592653589793 / 180.0;
++  }
++  if (capture_geometry_) cache_pose_ = T_W_L;
+ 
+   Accumulator identity_accumulator;
+   identity_accumulator.huber_delta = config_.huber_delta;
++  identity_accumulator.split = config_.split_information;
+ 
+   Accumulator total = tbb::parallel_deterministic_reduce(
+       tbb::blocked_range<size_t>(0, points_j_.size()),
+       identity_accumulator,  // identity
+       [&](const tbb::blocked_range<size_t>& r, Accumulator local_acc) -> Accumulator {
+-        for (size_t i = r.begin(); i != r.end(); ++i) {
++        for (size_t i = r.begin(); i < r.end(); i += static_cast<size_t>(stride)) {
+           Point p_W = T_W_L.linear() * points_j_[i] + T_W_L.translation();
+-          size_t hash = map_.hashIndex(p_W);
+-          const Voxel* voxel = map_.getVoxel(hash);
+-          if (!voxel) {
+-            if (!map_.nearestVoxel(p_W, hash)) continue;
+-            voxel = map_.getVoxel(hash);
+-            if (!voxel) continue;
++          size_t hash = 0;
++          const Voxel* voxel = nullptr;
++          if (config_.reuse_direct_voxel_lookup && i < geo_cache_.size()) {
++            const auto& cached_lookup = geo_cache_[i];
++            hash = map_.hashIndex(p_W);
++            if (cached_lookup.direct_lookup && cached_lookup.voxel &&
++                cached_lookup.direct_hash == hash) {
++              voxel = cached_lookup.voxel;
++              ++local_acc.direct_voxel_lookup_hits;
++            }
+           }
++          if (!voxel) voxel = findVoxel(p_W, hash);
++          if (!voxel) continue;
+ 
+           const double inv_size = map_.inv_px_size;
+           const auto& T_C_W = voxel->T_C_W_;
+@@ -82,23 +249,70 @@ double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6*
+           const double x = p_o.x() * inv_size;
+           const double y = p_o.y() * inv_size;
+ 
++          // The observed incidence uses a normal fitted from this scan alone.
++          // The prediction uses the mapped voxel plane and the trial rotation.
++          // A cosine difference avoids the singular derivative of acos near 0 degrees.
++          bool incidence_valid = false;
++          double incidence_r = 0.0;
++          Row6 incidence_J = Row6::Zero();
++          if (config_.incidence_residual && mode_ == RegistrationMode::Joint &&
++              source_normals_j_ && source_normals_j_->size() == points_j_.size() &&
++              (*source_normals_j_)[i].squaredNorm() > 0.5 &&
++              points_j_[i].squaredNorm() > 1e-6) {
++            const V3 ray_j = points_j_[i].normalized();
++            const V3 normal_m = T_C_W.linear().row(2).transpose();
++            const double observed = std::abs((*source_normals_j_)[i].dot(ray_j));
++            const double signed_predicted = normal_m.dot(T_W_L.linear() * ray_j);
++            const double predicted = std::abs(signed_predicted);
++            // At grazing incidence, small normal errors dominate the comparison.
++            if (observed >= 0.2 && predicted >= 0.2) {
++              incidence_valid = true;
++              incidence_r = config_.incidence_scale * (predicted - observed);
++              if (compute_jacobians) {
++                const double sign = signed_predicted >= 0.0 ? 1.0 : -1.0;
++                incidence_J.block<1, 3>(0, 0) =
++                    -config_.incidence_scale * sign *
++                    normal_m.transpose() * T_W_L.linear() * skew(ray_j);
++              }
++            }
++          }
++
+           // Photometric residual of intensity points: difference between the filtered point
+           // intensity and the intensity map of the voxel.
+           const double intensity_j = intensities_j_ ? (*intensities_j_)[i] : kInvalidIntensity;
+           const bool photometric = intensity_j >= 0.0 && voxel->intensity_weights_.size() > 0;
++          double photo_weight = weak_photo_weights_.empty() ? 1.0 : weak_photo_weights_[i];
++          double confidence = 1.0;
++          if (photometric && config_.photo_confidence) {
++            confidence = frozen_photo_confidence_.empty()
++                             ? photoConfidence(config_, *voxel, p_W,
++                                               T_W_L.translation())
++                             : frozen_photo_confidence_[i];
++            photo_weight *= confidence;
++          }
++          if (compute_jacobians && photometric &&
++              mode_ != RegistrationMode::GeometryOnly) {
++            if (confidence <= 0.0) ++local_acc.photo_confidence_zero;
++          }
+ 
+           double I = 0.0;
+ 
+           if (!compute_jacobians) {
+-            if (!config_.img_residual || getSubPixelValue(voxel, x, y, I)) {
++            if (mode_ != RegistrationMode::PhotoOnly &&
++                (!config_.img_residual || getSubPixelValue(voxel, x, y, I))) {
+               const double r = p_o.z() - I;
+               local_acc.add(r, nullptr);
+             }
+             double I_photo = 0.0;
+-            if (photometric && getSubPixelValue(voxel->intensity_smoothed_,
+-                                                voxel->intensity_weights_, x, y, I_photo)) {
+-              local_acc.addPhotometric(config_.photo_scale * (intensity_j - I_photo), nullptr);
++            if (mode_ != RegistrationMode::GeometryOnly && photometric &&
++                photo_weight > 0.0 &&
++                getSubPixelValue(voxel->intensity_smoothed_,
++                                 voxel->intensity_weights_, x, y, I_photo)) {
++              local_acc.addPhotometric(
++                  std::sqrt(photo_weight) * config_.photo_scale *
++                      (intensity_j - I_photo), nullptr);
+             }
++            if (incidence_valid) local_acc.addIncidence(incidence_r, nullptr);
+             continue;
+           }
+ 
+@@ -108,7 +322,23 @@ double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6*
+ 
+           double dIdx = 0.0;
+           double dIdy = 0.0;
+-          if (!config_.img_residual || sampleValueAndGradient(voxel, x, y, I, dIdx, dIdy)) {
++          // Reuse path: the correspondence and the Jacobian come from the capture
++          // pose, the residual is still evaluated here. Any mismatch (different
++          // voxel, different point count) silently falls back to the exact path.
++          const bool cache_hit = reuse && i < geo_cache_.size() &&
++                                geo_cache_[i].voxel == voxel;
++          if (reuse && !cache_hit) ++local_acc.geometry_cache_misses;
++          const bool cached = cache_hit && !config_.geometry_cache_recompute_jacobian;
++          if (mode_ != RegistrationMode::PhotoOnly && cached) {
++            double I_cached = 0.0;
++            if (!config_.img_residual || getSubPixelValue(voxel, x, y, I_cached)) {
++              const double r = p_o.z() - I_cached;
++              local_acc.add(r, &geo_cache_[i].J);
++              ++local_acc.reused_geometry_count;
++            }
++          } else if (mode_ != RegistrationMode::PhotoOnly &&
++                     (!config_.img_residual ||
++                      sampleValueAndGradient(voxel, x, y, I, dIdx, dIdy))) {
+             Eigen::Matrix<double, 1, 2> I_Jac = Eigen::Matrix<double, 1, 2>::Zero();
+             if (config_.img_jacobian) {
+               I_Jac(0, 0) = dIdx;
+@@ -120,22 +350,34 @@ double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6*
+ 
+             const double r = p_o.z() - I;
+             local_acc.add(r, &J);
++            if (capture_geometry_ && i < geo_cache_.size()) {
++              geo_cache_[i].voxel = voxel;
++              geo_cache_[i].J = J;
++              geo_cache_[i].direct_hash = hash;
++              geo_cache_[i].direct_lookup = hash == map_.hashIndex(p_W);
++            }
+           }
+ 
++          if (incidence_valid) local_acc.addIncidence(incidence_r, &incidence_J);
++
+           double I_photo = 0.0;
+           double dIdx_photo = 0.0;
+           double dIdy_photo = 0.0;
+-          if (photometric &&
++          if (mode_ != RegistrationMode::GeometryOnly && photometric &&
++              photo_weight > 0.0 &&
+               sampleValueAndGradient(voxel->intensity_smoothed_, voxel->intensity_weights_, x, y,
+                                      I_photo, dIdx_photo, dIdy_photo)) {
+             Eigen::Matrix<double, 1, 2> I_Jac;
+             I_Jac << dIdx_photo, dIdy_photo;
+-            I_Jac *= config_.photo_scale * inv_size;
++            I_Jac *= std::sqrt(photo_weight) * config_.photo_scale * inv_size;
+ 
+             Row6 J = -(I_Jac * SE3_Jac.topRows<2>());
+ 
+-            const double r = config_.photo_scale * (intensity_j - I_photo);
++            const double r = std::sqrt(photo_weight) * config_.photo_scale *
++                             (intensity_j - I_photo);
+             local_acc.addPhotometric(r, &J);
++            local_acc.photo_confidence_sum += confidence;
++            ++local_acc.photo_confidence_count;
+           }
+         }
+ 
+@@ -147,6 +389,7 @@ double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6*
+         return out;
+       });
+ 
++  direct_voxel_lookup_hits_ += total.direct_voxel_lookup_hits;
+   if (compute_jacobians) {
+     *H = total.H;
+     *b = total.b;
+@@ -154,6 +397,16 @@ double LsqRegistration::linearize(const Transform& T_W_L, Matrix66* H, Vector6*
+     // linearization so the pipeline can report the effective point count.
+     num_effective_points_ = total.count;
+     num_photometric_points_ = total.photo_count;
++    num_incidence_points_ = total.incidence_count;
++    mean_photo_confidence_ = total.photo_confidence_count > 0
++                                 ? total.photo_confidence_sum /
++                                       static_cast<double>(total.photo_confidence_count)
++                                 : (config_.photo_confidence ? -1.0 : 1.0);
++    num_photo_confidence_zero_ = total.photo_confidence_zero;
++    H_geo_ = total.H_geo;
++    H_photo_ = total.H_photo;
++    reused_points_ = total.reused_geometry_count;
++    cache_misses_ = total.geometry_cache_misses;
+   }
+ 
+   return total.error_sum;
+@@ -189,24 +442,51 @@ bool LsqRegistration::stepLm(Transform& x0, Transform& delta) {
+   Matrix66 H;
+   Vector6 b;
+   double y0 = linearize(x0, &H, &b);
++  // Reference cost on the same subsample the pre-screen uses.
++  const double y0_sub = config_.lm_trial_stride > 1
++                            ? linearize(x0, nullptr, nullptr, config_.lm_trial_stride)
++                            : y0;
+ 
+   if (lm_lambda_ < 0.0) {
+-    lm_lambda_ = config_.lm_init_lambda_factor * H.diagonal().array().abs().maxCoeff();
++    lm_lambda_ = std::max(1e-9, config_.lm_init_lambda_factor *
++                                   H.diagonal().array().abs().maxCoeff());
+   }
+ 
+   double nu = 2.0;
+   for (int i = 0; i < config_.lm_max_iterations; i++) {
+-    Eigen::LDLT<Matrix66> solver(H + lm_lambda_ * Matrix66::Identity());
+-    Vector6 d = solver.solve(-b);
++    // Solve in the allowed tangent subspace. The identity term on its
++    // orthogonal complement makes the 6x6 system nonsingular and fixes those
++    // coordinates exactly at zero.
++    const Matrix66 projected_system =
++        step_projector_ * H * step_projector_ +
++        lm_lambda_ * step_projector_ +
++        (Matrix66::Identity() - step_projector_);
++    Eigen::LDLT<Matrix66> solver(projected_system);
++    Vector6 d = step_projector_ * solver.solve(-step_projector_ * b);
++    if (solver.info() != Eigen::Success || !d.allFinite()) return false;
+     delta.setIdentity();
++    if (d.squaredNorm() < 1e-24) return true;
+     delta.linear() = so3_exp(d.head<3>()).toRotationMatrix();
+     delta.translation() = d.tail<3>();
+ 
+     Transform xi = x0 * delta;
++    if (config_.lm_trial_stride > 1) {
++      ++prescreen_passes_;
++      const double yi_sub =
++          linearize(xi, nullptr, nullptr, config_.lm_trial_stride);
++      const double rho_sub = (y0_sub - yi_sub) / (d.dot(lm_lambda_ * d - b));
++      if (rho_sub < config_.lm_prescreen_margin) {
++        ++rejected_steps_;
++        lm_lambda_ *= nu;
++        nu *= 2;
++        continue;
++      }
++    }
+     double yi = linearize(xi);
+     double rho = (y0 - yi) / (d.dot(lm_lambda_ * d - b));
+ 
+     if (rho < 0) {
++      ++rejected_steps_;
+       if (isConverged(delta)) {
+         return true;
+       }
+@@ -224,4 +504,4 @@ bool LsqRegistration::stepLm(Transform& x0, Transform& delta) {
+   return false;
+ }
+ 
+-}  // namespace bievr
+\ No newline at end of file
++}  // namespace bievr
+diff --git a/BIEVR/src/pipeline.cpp b/BIEVR/src/pipeline.cpp
+index d840ca7..b706338 100644
+--- a/BIEVR/src/pipeline.cpp
++++ b/BIEVR/src/pipeline.cpp
+@@ -1,7 +1,18 @@
+ #include "bievr_lio/pipeline.h"
+ 
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
+ #include <fstream>
++#include <functional>
++#include <future>
++#include <limits>
+ #include <sstream>
++#include <unordered_map>
++#include <utility>
++
++#include <Eigen/Eigenvalues>
+ 
+ #include "bievr_lio/inertial_factor.h"
+ #include "bievr_lio/prior_factor.h"
+@@ -11,7 +22,88 @@
+ 
+ namespace bievr {
+ 
+-Pipeline::Pipeline(const Config& config) : config_(config) {
++namespace {
++
++double median(std::vector<double> values) {
++  const size_t middle = values.size() / 2;
++  std::nth_element(values.begin(), values.begin() + middle, values.end());
++  const double upper = values[middle];
++  if (values.size() % 2 != 0) return upper;
++  std::nth_element(values.begin(), values.begin() + middle - 1, values.begin() + middle);
++  return 0.5 * (upper + values[middle - 1]);
++}
++
++double madScale(const std::vector<double>& residuals) {
++  const double center = median(residuals);
++  std::vector<double> deviations;
++  deviations.reserve(residuals.size());
++  for (double r : residuals) deviations.push_back(std::abs(r - center));
++  return 1.4826 * median(std::move(deviations));
++}
++
++// Fit source normals from the current undistorted scan only. No map geometry or
++// trial pose enters the observed incidence. Zero marks an unusable fit.
++std::vector<V3> estimateScanNormals(const Pointcloud& cloud, const Pointcloud& samples) {
++  constexpr double cell = 0.35;
++  using Key = std::array<int, 3>;
++  struct Hash {
++    size_t operator()(const Key& k) const {
++      size_t h = 0;
++      for (int v : k) h ^= std::hash<int>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
++      return h;
++    }
++  };
++  struct Moments {
++    int count = 0;
++    V3 sum = V3::Zero();
++    M3 outer = M3::Zero();
++    void add(const V3& p) { ++count; sum += p; outer.noalias() += p * p.transpose(); }
++    void merge(const Moments& x) { count += x.count; sum += x.sum; outer += x.outer; }
++  };
++  auto key = [cell](const V3& p) -> Key {
++    return {static_cast<int>(std::floor(p.x() / cell)),
++            static_cast<int>(std::floor(p.y() / cell)),
++            static_cast<int>(std::floor(p.z() / cell))};
++  };
++  std::unordered_map<Key, Moments, Hash> grid;
++  grid.reserve(cloud.size() / 4 + 1);
++  for (size_t i = 0; i < cloud.size(); ++i) {
++    const V3 p = cloud[i];
++    if (p.allFinite()) grid[key(p)].add(p);
++  }
++  std::vector<V3> normals(samples.size(), V3::Zero());
++  for (size_t i = 0; i < samples.size(); ++i) {
++    const V3 p = samples[i];
++    if (!p.allFinite()) continue;
++    const Key center = key(p);
++    Moments local;
++    for (int dx = -1; dx <= 1; ++dx)
++      for (int dy = -1; dy <= 1; ++dy)
++        for (int dz = -1; dz <= 1; ++dz) {
++          const auto it = grid.find({center[0] + dx, center[1] + dy, center[2] + dz});
++          if (it != grid.end()) local.merge(it->second);
++        }
++    if (local.count < 12) continue;
++    const V3 mean = local.sum / static_cast<double>(local.count);
++    const M3 cov = local.outer / static_cast<double>(local.count) - mean * mean.transpose();
++    const Eigen::SelfAdjointEigenSolver<M3> eig(cov);
++    if (eig.info() != Eigen::Success || eig.eigenvalues()(1) < 1e-4 ||
++        eig.eigenvalues()(0) > 0.1 * eig.eigenvalues()(1)) continue;
++    const V3 n = eig.eigenvectors().col(0);
++    if (std::abs(n.dot(p - mean)) > 0.1) continue;
++    normals[i] = n;
++  }
++  return normals;
++}
++
++}  // namespace
++
++Pipeline::Pipeline(const Config& config)
++    : config_(config), photo_scale_(config.registration.photo_scale) {
++  if (config_.pipeline_geo_threads > 0)
++    pipeline_geo_arena_ = std::make_unique<tbb::task_arena>(config_.pipeline_geo_threads);
++  if (config_.pipeline_joint_threads > 0)
++    pipeline_joint_arena_ = std::make_unique<tbb::task_arena>(config_.pipeline_joint_threads);
+   // The intensity map is only needed (and filled) if intensities are processed.
+   config_.map.intensity = config_.intensity.enabled;
+   map_ = std::make_shared<BIEVRMap>(config_.map);
+@@ -49,18 +141,132 @@ Pipeline::Pipeline(const Config& config) : config_(config) {
+   }
+ }
+ 
++void Pipeline::updateObservability(const Matrix66& H_geo, const Matrix66& H_photo, int points) {
++  const double alpha = std::clamp(config_.observability_alpha, 1e-3, 1.0);
++  if (observability_.frames == 0) {
++    observability_.H_geo = H_geo;
++    observability_.H_photo = H_photo;
++  } else {
++    observability_.H_geo = (1.0 - alpha) * observability_.H_geo + alpha * H_geo;
++    observability_.H_photo = (1.0 - alpha) * observability_.H_photo + alpha * H_photo;
++  }
++  observability_.geometry_points = static_cast<size_t>(std::max(0, points));
++  ++observability_.frames;
++}
++
+ void Pipeline::processFrame(const std::vector<ImuMeasurement>& imu_data,
+                             const StampedIntensityPointcloud& points_L) {
+-  timing::Timer step_timer("step");
+-
+   if (imu_data.empty()) {
+     LOG(W, "No IMU data to process.");
+     return;
+   }
+ 
+-  // Cache the latest gyro reading so the odometry twist can report the current
+-  // angular velocity (already expressed in the body/IMU frame).
+-  latest_gyro_ = imu_data.back().gyro;
++  const auto call_start = std::chrono::steady_clock::now();
++  timing::Timer call_timer("pipeline_call");
++  if (config_.pipeline_geo_overlap && phase_ == Phase::Running &&
++      config_.intensity.enabled && config_.registration.sequential_photo &&
++      config_.observability_state != "on") {
++    if (config_.registration.sorted_lookup) map_->buildSortedIndex();
++    const State prior = pending_geometry_ ? pending_geometry_->provisional_end
++                                          : states_.rbegin()->second;
++    const V3 acc_bias = acc_bias_;
++    const V3 gyro_bias = gyro_bias_;
++    const V3 gravity_dir = gravity_dir_;
++    const double imu_scale = imu_acc_scale_;
++    // Finish state-independent intensity/range work before starting the joint
++    // worker, leaving its runtime available for the geometric preparation.
++    PreparedFrame current = prepareFrame(imu_data, points_L);
++    const int anchor_period = std::max(1, config_.registration.geometry_anchor_period);
++    current.pipeline_anchor_requested =
++        (pipeline_frames_enqueued_ % static_cast<size_t>(anchor_period)) == 0;
++    ++pipeline_frames_enqueued_;
++    if (current.pipeline_anchor_requested && !current.filtered_I.empty())
++      ++pipeline_geo_attempted_;
++    else
++      ++pipeline_geo_skipped_;
++    std::future<void> previous;
++    // Acquire before starting the worker. The worker can read the map, but its
++    // integration waits until this scan's geometry prefetch has completed.
++    std::shared_lock<std::shared_mutex> map_hold(pipeline_map_mutex_);
++    if (pending_frame_) {
++      PreparedFrame job = std::move(*pending_frame_);
++      GeometryPrefetch geo = std::move(*pending_geometry_);
++      pending_frame_.reset();
++      pending_geometry_.reset();
++      previous = std::async(std::launch::async,
++                            [this, job = std::move(job), geo = std::move(geo)]() mutable {
++        processPreparedFrame(job, &geo);
++      });
++    }
++    GeometryPrefetch current_geo;
++    if (pipeline_geo_arena_) {
++      current_geo = pipeline_geo_arena_->execute([&] {
++        return prefetchGeometry(current, prior, acc_bias, gyro_bias, gravity_dir, imu_scale,
++                                current.pipeline_anchor_requested);
++      });
++    } else {
++      current_geo = prefetchGeometry(current, prior, acc_bias, gyro_bias, gravity_dir, imu_scale,
++                                     current.pipeline_anchor_requested);
++    }
++    map_hold.unlock();
++    if (previous.valid()) previous.get();
++    pending_frame_ = std::move(current);
++    pending_geometry_ = std::move(current_geo);
++    call_timer.Stop();
++    pipeline_call_ms_sum_ += std::chrono::duration<double, std::milli>(
++                                 std::chrono::steady_clock::now() - call_start).count();
++    ++pipeline_calls_;
++    return;
++  }
++  // Initialization is serial. In running mode only scan-local preprocessing of
++  // k overlaps with the complete stateful solve of k-1.
++  if (!config_.pipeline_overlap || phase_ != Phase::Running) {
++    flushPendingFrame();
++    const auto frame = prepareFrame(imu_data, points_L);
++    processPreparedFrame(frame);
++    call_timer.Stop();
++    pipeline_call_ms_sum_ += std::chrono::duration<double, std::milli>(
++                                 std::chrono::steady_clock::now() - call_start).count();
++    ++pipeline_calls_;
++    return;
++  }
++
++  std::future<void> previous;
++  if (pending_frame_) {
++    PreparedFrame job = std::move(*pending_frame_);
++    pending_frame_.reset();
++    previous = std::async(std::launch::async, [this, job = std::move(job)]() mutable {
++      processPreparedFrame(job);
++    });
++  }
++  PreparedFrame current = prepareFrame(imu_data, points_L);
++  if (previous.valid()) previous.get();
++  pending_frame_ = std::move(current);
++  call_timer.Stop();
++  pipeline_call_ms_sum_ += std::chrono::duration<double, std::milli>(
++                               std::chrono::steady_clock::now() - call_start).count();
++  ++pipeline_calls_;
++}
++
++void Pipeline::flushPendingFrame() {
++  if (!pending_frame_) return;
++  PreparedFrame job = std::move(*pending_frame_);
++  pending_frame_.reset();
++  if (pending_geometry_) {
++    GeometryPrefetch geo = std::move(*pending_geometry_);
++    pending_geometry_.reset();
++    processPreparedFrame(job, &geo);
++  } else {
++    processPreparedFrame(job);
++  }
++}
++
++Pipeline::PreparedFrame Pipeline::prepareFrame(
++    const std::vector<ImuMeasurement>& imu_data,
++    const StampedIntensityPointcloud& points_L) {
++  timing::Timer prepare_timer("pipeline_prepare");
++  PreparedFrame frame;
++  frame.imu = imu_data;
+ 
+   // Replace the raw intensities by the filtered ones. This has to happen before any point is
+   // removed, as the intensity processing relies on the original point order of the scan.
+@@ -78,21 +284,89 @@ void Pipeline::processFrame(const std::vector<ImuMeasurement>& imu_data,
+ 
+   // Remove points outside of intended range
+   timing::Timer filter_timer("01_filter");
+-  StampedIntensityPointcloud points_filtered_L;
+-  filterMinMaxRange(points_input_L, points_filtered_L, config_.preprocess.min_range,
++  filterMinMaxRange(points_input_L, frame.filtered_L, config_.preprocess.min_range,
+                     config_.preprocess.max_range);
+   // The per-point time and intensity stay in points_filtered_L; we only take
+   // zero-copy views onto those rows. Undistortion consumes the time view, intensity
+   // rides through to publishing. Both views remain valid for the whole frame and
+   // stay aligned by index with the spatial clouds derived below, since every
+   // transform downstream preserves point order.
+-  const StampedIntensityPointcloud& filtered_L = points_filtered_L;
+-  const TimeView times = filtered_L.times();
+-  const IntensityView intensities = filtered_L.intensities();
+   // Transform only the spatial coordinates into the IMU frame (single 3xN write);
+   // time and intensity are never rewritten.
+-  const Pointcloud points_filtered_I = transformPoints(config_.T_I_L, points_filtered_L);
++  frame.filtered_I = transformPoints(config_.T_I_L, frame.filtered_L);
+   filter_timer.Stop();
++  prepare_timer.Stop();
++  return frame;
++}
++
++Pipeline::GeometryPrefetch Pipeline::prefetchGeometry(
++    const PreparedFrame& frame, const State& prior,
++    const V3& acc_bias, const V3& gyro_bias,
++    const V3& gravity_dir, double imu_scale, bool solve_geometry) {
++  GeometryPrefetch out;
++  const auto begin = std::chrono::steady_clock::now();
++  out.begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                     begin.time_since_epoch()).count();
++  out.stamp = frame.filtered_L.end_stamp;
++  std::vector<ImuMeasurement> imu = frame.imu;
++  if (imu_scale != 1.0) {
++    for (auto& measurement : imu) measurement.acc *= imu_scale;
++  }
++  auto integrator = std::make_shared<ImuIntegrator>(config_.imu, acc_bias, gyro_bias);
++  integrator->integrate(imu);
++  State predicted{};
++  integrator->predict(prior.quat, prior.p, prior.v, gravity_dir * kGMagnitude,
++                      predicted.quat, predicted.p, predicted.v);
++  predicted.id = prior.id + 1;
++  out.predicted = Transform(predicted.quat, predicted.p);
++  out.geometry = out.predicted;
++  out.provisional_end = predicted;
++  out.attempted = solve_geometry && !frame.filtered_I.empty();
++  if (!solve_geometry || frame.filtered_I.empty()) {
++    out.end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                     std::chrono::steady_clock::now().time_since_epoch()).count();
++    return out;
++  }
++
++  Pointcloud undistorted;
++  undistortCloud(integrator, prior, frame.filtered_I, frame.filtered_L.times(),
++                 frame.filtered_L.stamp, gravity_dir * kGMagnitude, undistorted);
++  SourceSamples samples;
++  sampleSource(undistorted, frame.filtered_L.intensities(), out.predicted, samples);
++  const auto solve_begin = std::chrono::steady_clock::now();
++  out.prep_ms = std::chrono::duration<double, std::milli>(solve_begin - begin).count();
++  out.solve_begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                           solve_begin.time_since_epoch()).count();
++  LsqRegistration solver(*map_, samples.filtered, config_.registration,
++                         nullptr, RegistrationMode::GeometryOnly);
++  out.geometry = solver.computeTransformation(out.predicted);
++  out.information = solver.informationAt(out.geometry);
++  out.matches = solver.numEffectivePoints();
++  out.valid = out.matches >= 100 && out.information.allFinite();
++  if (out.valid) {
++    out.provisional_end.quat = out.geometry.quaternion();
++    out.provisional_end.p = out.geometry.translation();
++  }
++  const auto solve_end = std::chrono::steady_clock::now();
++  out.solve_ms = std::chrono::duration<double, std::milli>(
++                     solve_end - solve_begin).count();
++  out.solve_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                         solve_end.time_since_epoch()).count();
++  out.end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                   std::chrono::steady_clock::now().time_since_epoch()).count();
++  return out;
++}
++
++void Pipeline::processPreparedFrame(const PreparedFrame& frame,
++                                    const GeometryPrefetch* prefetched) {
++  timing::Timer step_timer("step");
++  const auto frame_t0 = std::chrono::steady_clock::now();
++  const auto& imu_data = frame.imu;
++  const auto& points_filtered_L = frame.filtered_L;
++  const auto& points_filtered_I = frame.filtered_I;
++  const TimeView times = points_filtered_L.times();
++  const IntensityView intensities = points_filtered_L.intensities();
++  latest_gyro_ = imu_data.back().gyro;
+ 
+   if (phase_ == Phase::NeedBias) {
+     // Estimate initial biases and orientation based on zero velocity assumption.
+@@ -148,20 +422,766 @@ void Pipeline::processFrame(const std::vector<ImuMeasurement>& imu_data,
+   }
+ 
+   // Select points from the source cloud that will be used for registration
++  std::shared_lock<std::shared_mutex> map_read_lock;
++  if (config_.pipeline_geo_overlap && prefetched)
++    map_read_lock = std::shared_lock<std::shared_mutex>(pipeline_map_mutex_);
+   timing::Timer voxel_timer("04_sampling");
+   SourceSamples samples;
+   sampleSource(points_undistorted_I, intensities, T_W_I_init, samples);
++  const std::vector<V3> scan_normals = config_.registration.incidence_residual
++      ? estimateScanNormals(points_undistorted_I, samples.filtered) : std::vector<V3>();
++  const size_t valid_scan_normals = std::count_if(
++      scan_normals.begin(), scan_normals.end(),
++      [](const V3& n) { return n.squaredNorm() > 0.5; });
+   voxel_timer.Stop();
+ 
++  // Sorted (key -> voxel) index for the registration lookups. Built after the map
++  // update of the previous scan and before the first solve of this one, so the
++  // pointers it holds stay valid for the whole registration block.
++  if (config_.registration.sorted_lookup && !prefetched) {
++    timing::Timer index_timer("04b_map_index");
++    map_->buildSortedIndex();
++    index_timer.Stop();
++  }
++
+   // Perform the actual registration
+   timing::Timer align_timer("05_registration");
+-  LsqRegistration optimizer(*map_, samples.filtered, config_.registration,
+-                            config_.intensity.enabled ? &samples.filtered_intensities : nullptr);
+-  const Transform T_W_I = optimizer.computeTransformation(T_W_I_init);
+-  const int n_effective_points = optimizer.numEffectivePoints();
+-  const int n_photometric_points =
+-      config_.intensity.enabled ? optimizer.numPhotometricPoints() : -1;
++  Transform T_W_I;
++  int n_effective_points = 0;
++  int n_photometric_points = -1;
++  int n_incidence_points = 0;
++  // Mean viewing-geometry confidence of the photometric correspondences and how many of them were
++  // weighted to zero, for the debug log. -1 when no photometric solve ran in this scan.
++  double photo_conf_mean = -1.0;
++  int photo_conf_zero = -1;
++  // Modality blocks of the final joint solve, for the observability state.
++  Matrix66 H_geo_block = Matrix66::Zero();
++  Matrix66 H_photo_block = Matrix66::Zero();
++  int block_points = 0;
++  bool skipped_geometry = false;
++  // Per-frame diagnostics for the geometry-cache experiment (RUN_GEOMETRY_CACHE_V17).
++  double geo_ms = -1.0;
++  double joint_ms = -1.0;
++  int cache_reused = 0;
++  int cache_misses = 0;
++  int direct_lookup_hits = 0;
++  double cache_dt = 0.0;
++  double cache_dr = 0.0;
++  // 1 when this scan ran the geometry solve, 0 when it reused the anchor result.
++  int geometry_anchored = -1;
++  // Point-set traversals of the two solves, for the timing experiments.
++  int joint_jacobian_passes = -1;
++  int joint_trial_passes = -1;
++  int joint_rejected_steps = -1;
++  int joint_prescreen_passes = -1;
++  int geometry_jacobian_passes = -1;
++  // Time of the three preparation passes between the geometry solve and the
++  // joint solve: residual collection, lambda information, weak-direction weights.
++  double prep_residuals_ms = -1.0;
++  double prep_photo_info_ms = -1.0;
++  double prep_weak_weights_ms = -1.0;
++  double geometry_probe_ms = 0.0;
++  double geometry_probe_translation_m = -1.0;
++  double geometry_probe_rotation_deg = -1.0;
++  int geometry_probe_matches = 0;
++  bool geometry_probe_skipped = false;
++  if (config_.intensity.enabled && config_.registration.sequential_photo) {
++    auto run_joint = [this, prefetched](auto&& work) -> decltype(auto) {
++      if (prefetched && pipeline_joint_arena_)
++        return pipeline_joint_arena_->execute(std::forward<decltype(work)>(work));
++      return work();
++    };
++    // The geometric solve exists for two reasons: a start pose for the joint stage and
++    // a geometric information matrix for the weak directions and the scale schedule.
++    // Both change slowly, so with `observability_state: on` the second reason is
++    // served by the state maintained from the previous scans' joint solves, and the
++    // solve is skipped entirely; the joint stage then starts from the IMU prediction.
++    const bool observability_skip =
++        config_.observability_state == "on" && observability_.valid() &&
++        config_.registration.second_stage_mode == "joint_weak_photo";
++    // Anchor schedule: run the geometry solve only every `geometry_anchor_period`
++    // scans, and earlier when the scan has moved past the drift threshold. Between
++    // anchors the joint stage starts from the IMU prediction and borrows the
++    // anchored information matrix, which is what the weak-direction gate and the
++    // scale schedule actually read.
++    const int anchor_period = std::max(1, config_.registration.geometry_anchor_period);
++    // frames_since_anchor_ counts the scans already served by the anchor, so the next
++    // anchor is due when that count reaches period - 1.
++    bool anchor_due = prefetched ? frame.pipeline_anchor_requested
++                                : (!geometry_anchor_valid_ ||
++                                   (frames_since_anchor_ + 1) >= anchor_period);
++    if (!geometry_anchor_valid_) anchor_due = true;
++    if (!anchor_due) {
++      const double anchor_drift =
++          (T_W_I_init.translation() - T_geometry_anchor_.translation()).norm();
++      if (anchor_drift > config_.registration.geometry_anchor_max_drift_m) {
++        anchor_due = true;
++      }
++    }
++    const bool skip_geometry = observability_skip || !anchor_due;
++    geometry_anchored = skip_geometry ? 0 : 1;
++    const auto geo_t0 = std::chrono::steady_clock::now();
++    Transform T_geometry;
++    Matrix66 H_geometry;
++    int geometry_matches = 0;
++    std::unique_ptr<LsqRegistration> geometry_solver;
++    bool accepted_prefetch = false;
++    double rebase_translation = -1.0;
++    double rebase_rotation_deg = -1.0;
++    if (prefetched && prefetched->valid && !skip_geometry) {
++      const Transform correction = T_W_I_init * prefetched->predicted.inverse();
++      const Transform relative = prefetched->predicted.inverse() * T_W_I_init;
++      rebase_translation = relative.translation().norm();
++      rebase_rotation_deg = Eigen::AngleAxisd(relative.linear()).angle() *
++                            180.0 / 3.141592653589793;
++      if (rebase_translation <= config_.pipeline_geo_rebase_translation_m &&
++          rebase_rotation_deg <= config_.pipeline_geo_rebase_rotation_deg) {
++        T_geometry = correction * prefetched->geometry;
++        geometry_solver = std::make_unique<LsqRegistration>(
++            *map_, samples.filtered, config_.registration,
++            nullptr, RegistrationMode::GeometryOnly);
++        if (config_.registration.reuse_geometry_linearization)
++          geometry_solver->captureGeometryLinearization();
++        H_geometry = geometry_solver->informationAt(T_geometry);
++        geometry_matches = geometry_solver->numEffectivePoints();
++        accepted_prefetch = geometry_matches >= 100 && H_geometry.allFinite();
++        if (accepted_prefetch) {
++          ++pipeline_geo_reused_;
++          geometry_anchored = 2;
++          geometry_jacobian_passes = geometry_solver->jacobianPasses();
++        } else {
++          geometry_solver.reset();
++        }
++      }
++    }
++    if (prefetched && anchor_due && !accepted_prefetch) ++pipeline_geo_redone_;
++    if (skip_geometry) {
++      T_geometry = T_W_I_init;
++      if (observability_skip) {
++        H_geometry = observability_.H_geo;
++        geometry_matches = static_cast<int>(observability_.geometry_points);
++      } else {
++        H_geometry = H_geometry_anchor_;
++        geometry_matches = geometry_matches_anchor_;
++        ++frames_since_anchor_;
++      }
++      skipped_geometry = true;
++    } else if (!accepted_prefetch) {
++      geometry_solver = std::make_unique<LsqRegistration>(
++          *map_, samples.filtered, config_.registration, nullptr, RegistrationMode::GeometryOnly);
++      if (config_.registration.reuse_geometry_linearization ||
++          config_.registration.reuse_direct_voxel_lookup) {
++        geometry_solver->captureGeometryLinearization();
++      }
++      Matrix66 H_probe = Matrix66::Zero();
++      if (config_.registration.geometry_probe_enabled && !prefetched) {
++        const auto probe_begin = std::chrono::steady_clock::now();
++        Vector6 b_probe;
++        geometry_solver->linearizationAt(T_W_I_init, H_probe, b_probe);
++        geometry_probe_matches = geometry_solver->numEffectivePoints();
++        ++geometry_probe_frames_;
++        if (geometry_probe_matches >= config_.registration.geometry_probe_min_matches &&
++            H_probe.allFinite() && b_probe.allFinite()) {
++          const Eigen::SelfAdjointEigenSolver<Matrix66> eig(H_probe);
++          if (eig.info() == Eigen::Success && eig.eigenvalues().maxCoeff() > 1e-9) {
++            const double min_eigenvalue =
++                std::max(1e-9, 1e-4 * eig.eigenvalues().maxCoeff());
++            Vector6 delta = Vector6::Zero();
++            for (int direction = 0; direction < 6; ++direction) {
++              const double eigenvalue = eig.eigenvalues()(direction);
++              if (eigenvalue < min_eigenvalue) continue;
++              const Vector6 axis = eig.eigenvectors().col(direction);
++              delta.noalias() -= axis * (axis.dot(b_probe) / eigenvalue);
++            }
++            geometry_probe_translation_m = delta.tail<3>().norm();
++            geometry_probe_rotation_deg = delta.head<3>().norm() *
++                                          180.0 / 3.141592653589793;
++            geometry_probe_skipped = delta.allFinite() &&
++                geometry_probe_translation_m <=
++                    config_.registration.geometry_probe_max_translation_m &&
++                geometry_probe_rotation_deg <=
++                    config_.registration.geometry_probe_max_rotation_deg;
++          }
++        }
++        geometry_probe_ms = std::chrono::duration<double, std::milli>(
++                                std::chrono::steady_clock::now() - probe_begin).count();
++      }
++      if (geometry_probe_skipped) {
++        ++geometry_probe_skipped_;
++        geometry_anchored = 3;
++        T_geometry = T_W_I_init;
++        H_geometry = H_probe;
++      } else {
++        T_geometry = geometry_solver->computeTransformation(T_W_I_init);
++        H_geometry = geometry_solver->informationAt(T_geometry);
++      }
++      geometry_matches = geometry_solver->numEffectivePoints();
++      geometry_jacobian_passes = geometry_solver->jacobianPasses();
++      T_geometry_anchor_ = T_geometry;
++      H_geometry_anchor_ = H_geometry;
++      geometry_matches_anchor_ = geometry_matches;
++      geometry_anchor_valid_ = true;
++      frames_since_anchor_ = 0;
++    }
++    if (accepted_prefetch) {
++      T_geometry_anchor_ = T_geometry;
++      H_geometry_anchor_ = H_geometry;
++      geometry_matches_anchor_ = geometry_matches;
++      geometry_anchor_valid_ = true;
++      frames_since_anchor_ = 0;
++    }
++    if (prefetched) {
++      LOG(D, "PIPELINE_GEO requested=" << (frame.pipeline_anchor_requested ? 1 : 0)
++                                    << " attempted=" << (prefetched->attempted ? 1 : 0)
++                                    << " valid=" << (prefetched->valid ? 1 : 0)
++                                    << " anchor_due=" << (anchor_due ? 1 : 0)
++                                    << " reused=" << (accepted_prefetch ? 1 : 0)
++                                    << " redone=" << (anchor_due && !accepted_prefetch ? 1 : 0)
++                                    << " stamp=" << prefetched->stamp
++                                    << " begin_ns=" << prefetched->begin_ns
++                                    << " end_ns=" << prefetched->end_ns
++                                    << " solve_begin_ns=" << prefetched->solve_begin_ns
++                                    << " solve_end_ns=" << prefetched->solve_end_ns
++                                    << " prep_ms=" << prefetched->prep_ms
++                                    << " solve_ms=" << prefetched->solve_ms
++                                    << " rebase_m=" << rebase_translation
++                                    << " rebase_deg=" << rebase_rotation_deg
++                                    << " matches=" << geometry_matches);
++    }
++
++    geo_ms = std::chrono::duration<double, std::milli>(
++                 std::chrono::steady_clock::now() - geo_t0)
++                 .count();
++
++    RegistrationConfig photo_config = config_.registration;
++    photo_config.split_information = config_.observability_state != "off";
++    LsqRegistration photo(*map_, samples.filtered, photo_config,
++                          &samples.filtered_intensities);
++    double geometry_ratio = 0.0;
++    Eigen::Vector3d geometry_eigenvalues = Eigen::Vector3d::Zero();
++    const Eigen::Matrix3d H_translation = H_geometry.block<3, 3>(3, 3);
++    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(H_translation);
++    if (eig.info() == Eigen::Success && eig.eigenvalues().maxCoeff() > 1e-9) {
++      geometry_eigenvalues = eig.eigenvalues();
++      geometry_ratio = std::max(0.0, eig.eigenvalues().minCoeff() /
++                                         eig.eigenvalues().maxCoeff());
++    }
++    const double translation_gap =
++        (T_geometry.translation() - T_W_I_init.translation()).norm();
++    const double rotation_gap =
++        Eigen::AngleAxisd(T_W_I_init.linear().transpose() * T_geometry.linear()).angle();
++    const bool geometry_anchor_usable =
++        geometry_matches >= 100 &&
++        std::isfinite(translation_gap) && std::isfinite(rotation_gap) &&
++        translation_gap <= config_.registration.stage_max_translation_m &&
++        rotation_gap <= config_.registration.stage_max_rotation_deg *
++                            3.141592653589793 / 180.0;
++    const bool use_geometry_start =
++        geometry_anchor_usable && geometry_ratio >= 0.01;
++    const Transform& start = use_geometry_start ? T_geometry : T_W_I_init;
++    const auto prep_residuals_t0 = std::chrono::steady_clock::now();
++    const RegistrationResiduals residuals =
++        run_joint([&] { return photo.collectResiduals(start); });
++    prep_residuals_ms = std::chrono::duration<double, std::milli>(
++                            std::chrono::steady_clock::now() - prep_residuals_t0)
++                            .count();
++    double candidate = photo_scale_;
++    double alpha = 0.0;
++    double trial_scale = photo_scale_;
++    double schedule_target = photo_scale_;
++    bool schedule_updated = false;
++    int weak_directions = -1;
++    const double sigma_photo = residuals.photo.empty() ? 0.0 : madScale(residuals.photo);
++    // Raw intensity residuals keep correspondence quality independent of the
++    // current lambda. A high offset is penalized as well as a high spread.
++    size_t photo_inliers = 0;
++    if (sigma_photo > 1.0) {
++      for (double r : residuals.photo) {
++        if (std::abs(r) <= 2.5 * sigma_photo) ++photo_inliers;
++      }
++    }
++    const double inlier_fraction = residuals.photo.empty() ? 0.0 :
++        static_cast<double>(photo_inliers) / residuals.photo.size();
++    const double count_fraction =
++        std::min(1.0, static_cast<double>(residuals.photo.size()) / 100.0);
++    double photo_information_max = 0.0;
++    double photo_weak_information = 0.0;
++    double target_information = 0.0;
++    double required_scale_squared = 0.0;
++    double strong_direction_cap = 0.0;
++    int supported_weak_directions = 0;
++    double applied_guard_cap = 0.0;
++    double raw_guard_cap = 0.0;
++    double guard_alpha = 0.0;
++    int guarded_strong_directions = 0;
++    bool guard_applied = false;
++    bool guard_blocked_up = false;
++    if (config_.registration.adaptive_photo_scale &&
++        photo_config.photo_scale_mode != "discrete" &&
++        (use_geometry_start || config_.registration.adaptive_photo_guard) &&
++        residuals.geometry.size() >= 100 && residuals.photo.size() >= 30 &&
++        sigma_photo > 1.0) {
++      // Estimate the raw intensity Jacobian's information independently of the
++      // current lambda. A robust threshold in raw intensity units keeps the
++      // estimate from depending on the initial photometric scale.
++      RegistrationConfig information_config = photo_config;
++      information_config.photo_scale = 1.0;
++      information_config.huber_delta = 2.5 * sigma_photo;
++      // The scale estimate is only allowed to see the confidence when it is meant to: with
++      // `confidence_in_photo_information: False` the estimated candidate stays identical to the
++      // one of a run without the confidence, which isolates the effect on the solve.
++      if (!config_.registration.confidence_in_photo_information) {
++        information_config.photo_confidence = false;
++      }
++      LsqRegistration photo_information(*map_, samples.filtered, information_config,
++                                        &samples.filtered_intensities,
++                                        RegistrationMode::PhotoOnly);
++      photo_information.freezePhotoConfidence(start);
++      const auto prep_info_t0 = std::chrono::steady_clock::now();
++      const Matrix66 H_photo_raw =
++          run_joint([&] { return photo_information.informationAt(start); });
++      prep_photo_info_ms = std::chrono::duration<double, std::milli>(
++                               std::chrono::steady_clock::now() - prep_info_t0)
++                               .count();
++      const Eigen::Matrix3d H_photo_translation = H_photo_raw.block<3, 3>(3, 3);
++      const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> photo_eig(H_photo_translation);
++      if (photo_eig.info() == Eigen::Success &&
++          photo_information.numPhotometricPoints() >= 30) {
++        photo_information_max = photo_eig.eigenvalues().maxCoeff();
++        const double geometry_max = geometry_eigenvalues.maxCoeff();
++        // Lift geometrically weak translation directions toward one tenth of
++        // the best geometric direction, without making the strongest intensity
++        // direction exceed that geometric information. This is an experimental
++        // information-balance rule, not a measurement-noise estimate.
++        if (use_geometry_start && std::isfinite(photo_information_max) &&
++            photo_information_max > 1e-9 &&
++            geometry_max > 1e-9) {
++          target_information = geometry_max / 10.0;
++          for (int direction = 0; direction < 3; ++direction) {
++            if (geometry_eigenvalues(direction) >= target_information) continue;
++            const Eigen::Vector3d axis = eig.eigenvectors().col(direction);
++            const double directional_information =
++                axis.dot(H_photo_translation * axis);
++            if (!std::isfinite(directional_information) ||
++                directional_information < 0.01 * photo_information_max) {
++              continue;
++            }
++            photo_weak_information = supported_weak_directions == 0
++                                         ? directional_information
++                                         : std::min(photo_weak_information,
++                                                    directional_information);
++            required_scale_squared = std::max(
++                required_scale_squared,
++                (target_information - geometry_eigenvalues(direction)) /
++                    directional_information);
++            ++supported_weak_directions;
++          }
++          if (supported_weak_directions > 0 &&
++              std::isfinite(required_scale_squared)) {
++            strong_direction_cap = geometry_max / photo_information_max;
++            candidate = std::clamp(
++                std::sqrt(std::min(required_scale_squared, strong_direction_cap)),
++                photo_config.photo_scale_min, photo_config.photo_scale_max);
++            // The scheduler below decides when to apply this candidate.
++          }
++        }
++        if (config_.registration.adaptive_photo_guard &&
++            inlier_fraction >= 0.6 && std::isfinite(photo_information_max) &&
++            photo_information_max > 1e-9) {
++          // An IMU start does not qualify for an upward candidate update, but
++          // can still supply a local high-side safety limit. Only geometrically
++          // strong directions enter the limit, leaving weak directions free
++          // for intensity to help. Evaluate both modalities at the same pose.
++          const Matrix66 H_guard_geometry =
++              use_geometry_start || !geometry_solver ? H_geometry
++                  : run_joint([&] { return geometry_solver->informationAt(start); });
++          const Eigen::Matrix3d H_guard_translation =
++              H_guard_geometry.block<3, 3>(3, 3);
++          const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> guard_eig(
++              H_guard_translation);
++          if (guard_eig.info() == Eigen::Success &&
++              guard_eig.eigenvalues().maxCoeff() > 1e-9) {
++            const double strong_threshold =
++                guard_eig.eigenvalues().maxCoeff() / 10.0;
++            double cap_squared = std::numeric_limits<double>::infinity();
++            for (int direction = 0; direction < 3; ++direction) {
++              const double geometric = guard_eig.eigenvalues()(direction);
++              if (geometric < strong_threshold) continue;
++              const Eigen::Vector3d axis = guard_eig.eigenvectors().col(direction);
++              const double photometric = axis.dot(H_photo_translation * axis);
++              if (!std::isfinite(photometric) || photometric <= 1e-9) continue;
++              cap_squared = std::min(
++                  cap_squared,
++                  photo_config.photo_guard_fraction * geometric / photometric);
++              ++guarded_strong_directions;
++            }
++            if (guarded_strong_directions > 0 &&
++                std::isfinite(cap_squared) && cap_squared > 0.0) {
++              raw_guard_cap = std::sqrt(cap_squared);
++              applied_guard_cap = std::clamp(raw_guard_cap,
++                                             photo_config.photo_scale_min,
++                                             photo_config.photo_scale_max);
++            }
++          }
++        }
++      }
++    }
++
++    const std::string& scale_mode = photo_config.photo_scale_mode;
++    if (config_.registration.adaptive_photo_scale) {
++      const bool geometry_fully_constrained =
++          use_geometry_start && geometry_eigenvalues.maxCoeff() > 1e-9 &&
++          geometry_eigenvalues.minCoeff() >=
++              geometry_eigenvalues.maxCoeff() / 10.0;
++      const bool usable_candidate = supported_weak_directions > 0 &&
++          inlier_fraction >= 0.6;
++      if (scale_mode == "continuous" &&
++          (usable_candidate || geometry_fully_constrained)) {
++        schedule_target = geometry_fully_constrained
++                              ? photo_config.photo_scale_min : candidate;
++        alpha = geometry_fully_constrained
++                    ? photo_config.photo_scale_max_alpha
++                    : photo_config.photo_scale_max_alpha * inlier_fraction *
++                          count_fraction;
++        trial_scale = (1.0 - alpha) * photo_scale_ + alpha * schedule_target;
++        schedule_updated = alpha > 0.0;
++      } else if (scale_mode == "window") {
++        // Apply the preceding window at the start of the next one. No frame in
++        // the collection window uses a value estimated from that same window.
++        if (photo_window_scans_ >=
++            static_cast<size_t>(photo_config.photo_window_frames)) {
++          const size_t minimum = std::max<size_t>(5, photo_window_scans_ / 5);
++          if (photo_window_candidates_.size() >= minimum) {
++            schedule_target = median(photo_window_candidates_);
++            alpha = schedule_target < photo_scale_ ? 0.5 : 0.25;
++            trial_scale = (1.0 - alpha) * photo_scale_ + alpha * schedule_target;
++            schedule_updated = true;
++          }
++          photo_window_candidates_.clear();
++          photo_window_scans_ = 0;
++        }
++        ++photo_window_scans_;
++        if (geometry_fully_constrained)
++          photo_window_candidates_.push_back(photo_config.photo_scale_min);
++        else if (usable_candidate)
++          photo_window_candidates_.push_back(candidate);
++      } else if (scale_mode == "discrete") {
++        // Count weak translation eigen-directions; the four levels are an
++        // experimental extension of the paper's bounded, count-based schedule.
++        const Matrix66 H_discrete_geometry =
++            use_geometry_start || !geometry_solver ? H_geometry
++                : run_joint([&] { return geometry_solver->informationAt(start); });
++        const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> discrete_eig(
++            H_discrete_geometry.block<3, 3>(3, 3));
++        const double geometry_max = discrete_eig.info() == Eigen::Success
++                                        ? discrete_eig.eigenvalues().maxCoeff() : 0.0;
++        if (geometry_matches >= 100 && geometry_max > 1e-9) {
++          weak_directions = 0;
++          for (int direction = 0; direction < 3; ++direction)
++            if (discrete_eig.eigenvalues()(direction) < geometry_max / 10.0)
++              ++weak_directions;
++          // A single surprising classification is held, not followed without
++          // smoothing. Upward changes also require usable intensity matches.
++          const bool can_change = weak_directions <= discrete_target_level_ ||
++              (residuals.photo.size() >= 30 && inlier_fraction >= 0.6);
++          if (can_change && weak_directions != discrete_target_level_) {
++            if (pending_discrete_level_ == weak_directions)
++              ++pending_discrete_count_;
++            else {
++              pending_discrete_level_ = weak_directions;
++              pending_discrete_count_ = 1;
++            }
++            if (pending_discrete_count_ >= 2) {
++              discrete_target_level_ = weak_directions;
++              pending_discrete_level_ = -1;
++              pending_discrete_count_ = 0;
++            }
++          } else {
++            pending_discrete_level_ = -1;
++            pending_discrete_count_ = 0;
++          }
++          constexpr double levels[] = {0.0005, 0.001, 0.002, 0.003};
++          schedule_target = levels[discrete_target_level_];
++          alpha = schedule_target < photo_scale_ ? 0.5 : 0.15;
++          trial_scale = (1.0 - alpha) * photo_scale_ + alpha * schedule_target;
++          schedule_updated = true;
++        }
++      }
++      trial_scale = std::clamp(trial_scale, photo_config.photo_scale_min,
++                               photo_config.photo_scale_max);
++    }
++
++    if (config_.registration.adaptive_photo_guard && applied_guard_cap > 0.0 &&
++        photo_scale_ >= applied_guard_cap && trial_scale > photo_scale_) {
++      // A high scale should not increase further when reliable strong-direction
++      // information already places its target below the current scale.
++      trial_scale = photo_scale_;
++      guard_blocked_up = true;
++    }
++
++    double beta = 1.0;
++    if (config_.registration.adaptive_beta && use_geometry_start &&
++        residuals.photo.size() >= 30) {
++      const double degeneracy = std::clamp((0.05 - geometry_ratio) / 0.05, 0.0, 1.0);
++      const double quality = inlier_fraction * count_fraction;
++      beta = std::clamp(1.0 + 0.5 * degeneracy * quality - 0.5 * (1.0 - quality),
++                        0.5, 1.5);
++    }
++    photo_config.photo_scale = trial_scale * beta;
++    if (config_.registration.adaptive_photo_guard && applied_guard_cap > 0.0 &&
++        photo_config.photo_scale > applied_guard_cap) {
++      // v6's immediate clamp changed the pose and map abruptly. Move only a
++      // small, quality-weighted fraction toward the same information target.
++      // The v5 low-side candidate update remains untouched when below target.
++      guard_alpha = photo_config.photo_guard_max_alpha * inlier_fraction *
++                    count_fraction;
++      photo_config.photo_scale =
++          (1.0 - guard_alpha) * photo_config.photo_scale +
++          guard_alpha * applied_guard_cap;
++      trial_scale = photo_config.photo_scale / beta;
++      guard_applied = guard_alpha > 0.0;
++    }
++    const std::string& second_stage = photo_config.second_stage_mode;
++    // A photometric-only stage needs a trustworthy geometric anchor and enough
++    // intensity correspondences. Otherwise use the existing joint registration.
++    // When the joint stage starts at T_geometry the residuals collected above were
++    // already taken at that pose, so the match count comes for free. With an IMU
++    // start the count still needs its own pass at T_geometry.
++    const size_t photo_stage_matches =
++        second_stage != "joint" && geometry_anchor_usable
++            ? (use_geometry_start ? residuals.photo.size()
++                                  : run_joint([&] {
++                                      return photo.collectResiduals(T_geometry);
++                                    }).photo.size())
++            : 0;
++    const bool photo_stage_available = geometry_anchor_usable &&
++        photo_stage_matches >= 30;
++    bool use_photo_stage = photo_stage_available && second_stage != "joint";
++    Eigen::Matrix3d weak_projector = Eigen::Matrix3d::Zero();
++    int photo_weak_dimensions = 0;
++    if (use_photo_stage &&
++        (second_stage == "photo_weak_translation" ||
++         second_stage == "joint_weak_photo")) {
++      const double weak_threshold = geometry_eigenvalues.maxCoeff() / 10.0;
++      for (int direction = 0; direction < 3; ++direction) {
++        if (geometry_eigenvalues(direction) >= weak_threshold) continue;
++        const Eigen::Vector3d axis = eig.eigenvectors().col(direction);
++        weak_projector.noalias() += axis * axis.transpose();
++        ++photo_weak_dimensions;
++      }
++      // With no weak translation direction, keep the geometric pose.
++      if (photo_weak_dimensions == 0) use_photo_stage = false;
++    }
++    int directional_photo_points = 0;
++    double directional_photo_mean_weight = 0.0;
++    const auto joint_t0 = std::chrono::steady_clock::now();
++    if (use_photo_stage && second_stage == "joint_weak_photo") {
++      LsqRegistration directional_joint(*map_, samples.filtered, photo_config,
++                                         &samples.filtered_intensities,
++                                         RegistrationMode::Joint);
++      if (photo_config.incidence_residual) directional_joint.setSourceNormals(&scan_normals);
++      if ((photo_config.reuse_geometry_linearization ||
++           photo_config.reuse_direct_voxel_lookup) && geometry_solver) {
++        directional_joint.adoptGeometryLinearization(*geometry_solver);
++      }
++      directional_joint.freezePhotoConfidence(T_geometry);
++      const auto prep_weak_t0 = std::chrono::steady_clock::now();
++      directional_photo_points = run_joint([&] {
++        return directional_joint.setWeakPhotoWeights(T_geometry, weak_projector);
++      });
++      prep_weak_weights_ms = std::chrono::duration<double, std::milli>(
++                                 std::chrono::steady_clock::now() - prep_weak_t0)
++                                 .count();
++      directional_photo_mean_weight = directional_joint.meanWeakPhotoWeight();
++      if (directional_photo_points >= 30) {
++        T_W_I = run_joint([&] {
++          return directional_joint.computeTransformation(T_geometry);
++        });
++        n_effective_points = directional_joint.numEffectivePoints();
++        n_photometric_points = directional_joint.numPhotometricPoints();
++        n_incidence_points = directional_joint.numIncidencePoints();
++        photo_conf_mean = directional_joint.meanPhotoConfidence();
++        photo_conf_zero = directional_joint.numPhotoConfidenceZero();
++        H_geo_block = directional_joint.geometryInformation();
++        H_photo_block = directional_joint.photometricInformation();
++        block_points = n_effective_points;
++        cache_reused = directional_joint.reusedGeometryPoints();
++        cache_misses = directional_joint.geometryCacheMisses();
++        direct_lookup_hits = directional_joint.directVoxelLookupHits();
++        cache_dt = directional_joint.geometryCacheDeltaT();
++        cache_dr = directional_joint.geometryCacheDeltaR();
++        joint_jacobian_passes = directional_joint.jacobianPasses();
++        joint_trial_passes = directional_joint.trialPasses();
++        joint_rejected_steps = directional_joint.rejectedSteps();
++        joint_prescreen_passes = directional_joint.prescreenPasses();
++      } else {
++        use_photo_stage = false;
++      }
++    }
++    if (use_photo_stage && second_stage != "joint_weak_photo") {
++      LsqRegistration photo_only(*map_, samples.filtered, photo_config,
++                                 &samples.filtered_intensities,
++                                 RegistrationMode::PhotoOnly);
++      photo_only.freezePhotoConfidence(T_geometry);
++      if (second_stage == "photo_weak_translation")
++        photo_only.setTranslationProjector(weak_projector);
++      T_W_I = run_joint([&] { return photo_only.computeTransformation(T_geometry); });
++      n_effective_points = geometry_matches;
++      n_photometric_points = photo_only.numPhotometricPoints();
++      photo_conf_mean = photo_only.meanPhotoConfidence();
++      photo_conf_zero = photo_only.numPhotoConfidenceZero();
++    } else if (!skipped_geometry && photo_stage_available &&
++               (second_stage == "photo_weak_translation" ||
++                second_stage == "joint_weak_photo") &&
++               photo_weak_dimensions == 0) {
++      T_W_I = T_geometry;
++      n_effective_points = geometry_matches;
++      n_photometric_points = 0;
++      H_geo_block = H_geometry;
++      block_points = geometry_matches;
++    } else if (!use_photo_stage) {
++      LsqRegistration joint(*map_, samples.filtered, photo_config,
++                            &samples.filtered_intensities, RegistrationMode::Joint);
++      if (photo_config.incidence_residual) joint.setSourceNormals(&scan_normals);
++      joint.freezePhotoConfidence(start);
++      T_W_I = run_joint([&] { return joint.computeTransformation(start); });
++      n_effective_points = joint.numEffectivePoints();
++      n_photometric_points = joint.numPhotometricPoints();
++      n_incidence_points = joint.numIncidencePoints();
++      photo_conf_mean = joint.meanPhotoConfidence();
++      photo_conf_zero = joint.numPhotoConfidenceZero();
++      H_geo_block = joint.geometryInformation();
++      H_photo_block = joint.photometricInformation();
++      block_points = n_effective_points;
++      cache_reused = joint.reusedGeometryPoints();
++      cache_misses = joint.geometryCacheMisses();
++      cache_dt = joint.geometryCacheDeltaT();
++      cache_dr = joint.geometryCacheDeltaR();
++    }
++    joint_ms = std::chrono::duration<double, std::milli>(
++                   std::chrono::steady_clock::now() - joint_t0)
++                   .count();
++    if (prefetched) {
++      LOG(D, "PIPELINE_JOINT stamp=" << points_filtered_L.end_stamp
++                                     << " begin_ns="
++                                     << std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                            joint_t0.time_since_epoch()).count()
++                                     << " end_ns="
++                                     << std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                            std::chrono::steady_clock::now().time_since_epoch()).count()
++                                     << " ms=" << joint_ms);
++    }
++    photo_scale_ = trial_scale;
++    const double second_stage_translation_m =
++        (T_W_I.translation() - T_geometry.translation()).norm();
++    const double second_stage_rotation_deg =
++        Eigen::AngleAxisd(T_geometry.linear().transpose() * T_W_I.linear()).angle() *
++        180.0 / 3.141592653589793;
++    ++registration_attempts_;
++    if (use_geometry_start) ++geometry_starts_;
++    LOG(D, "Registration: start=" << (use_geometry_start ? "geometry" : "IMU")
++                                  << " second_stage=" << second_stage
++                                  << " photo_stage_used=" << use_photo_stage
++                                  << " geometry_anchor_usable=" << geometry_anchor_usable
++                                  << " photo_stage_matches=" << photo_stage_matches
++                                  << " photo_weak_dimensions=" << photo_weak_dimensions
++                                  << " directional_photo_points=" << directional_photo_points
++                                  << " directional_photo_mean_weight="
++                                  << directional_photo_mean_weight
++                                  << " second_stage_translation_m="
++                                  << second_stage_translation_m
++                                  << " second_stage_rotation_deg="
++                                  << second_stage_rotation_deg
++                                  << " lambda_mode=" << scale_mode
++                                  << " schedule_target=" << schedule_target
++                                  << " schedule_updated=" << schedule_updated
++                                  << " weak_directions=" << weak_directions
++                                  << " window_scans=" << photo_window_scans_
++                                  << " window_candidates=" << photo_window_candidates_.size()
++                                  << " discrete_level=" << discrete_target_level_
++                                  << " lambda=" << photo_scale_
++                                  << " lambda_used=" << photo_config.photo_scale
++                                  << " candidate=" << candidate << " alpha=" << alpha
++                                  << " beta=" << beta << " geometry_ratio=" << geometry_ratio
++                                  << " geometry_eigenvalues="
++                                  << geometry_eigenvalues.transpose()
++                                  << " photo_information_max=" << photo_information_max
++                                  << " photo_weak_information=" << photo_weak_information
++                                  << " target_information=" << target_information
++                                  << " required_scale_squared=" << required_scale_squared
++                                  << " strong_direction_cap=" << strong_direction_cap
++                                  << " supported_weak_directions="
++                                  << supported_weak_directions
++                                  << " guard_cap=" << applied_guard_cap
++                                  << " guard_cap_raw=" << raw_guard_cap
++                                  << " guard_alpha=" << guard_alpha
++                                  << " guard_blocked_up=" << guard_blocked_up
++                                  << " guarded_strong_directions="
++                                  << guarded_strong_directions
++                                  << " guard_applied=" << guard_applied
++                                  << " sigma_photo=" << sigma_photo
++                                  << " gap_m=" << translation_gap
++                                  << " gap_rad=" << rotation_gap
++                                  << " geometry=" << residuals.geometry.size()
++                                  << " photo=" << residuals.photo.size()
++                                  << " photo_inliers=" << photo_inliers
++                                  << " photo_conf_mean=" << photo_conf_mean
++                                  << " photo_conf_zero=" << photo_conf_zero
++                                  << " incidence=" << n_incidence_points
++                                  << " scan_normals=" << valid_scan_normals
++                                  << " obs_frames=" << observability_.frames
++                                  << " obs_skip=" << (skipped_geometry ? 1 : 0)
++                                  << " obs_geo_pts=" << observability_.geometry_points);
++    // One machine-readable line per frame for RUN_GEOMETRY_CACHE_V17.sh.
++    const double step_ms = std::chrono::duration<double, std::milli>(
++                               std::chrono::steady_clock::now() - frame_t0)
++                               .count();
++    LOG(D, "CACHE_FRAME geo=" << n_effective_points << " reused=" << cache_reused
++                              << " miss=" << cache_misses << " dt=" << cache_dt
++                              << " dr_deg=" << cache_dr * 180.0 / 3.141592653589793
++                              << " lam=" << photo_scale_ << " geo_ms=" << geo_ms
++                              << " joint_ms=" << joint_ms << " step_ms=" << step_ms
++                              << " anchor=" << geometry_anchored
++                              << " probe_ms=" << geometry_probe_ms
++                              << " probe_matches=" << geometry_probe_matches
++                              << " probe_dt=" << geometry_probe_translation_m
++                              << " probe_dr_deg=" << geometry_probe_rotation_deg
++                              << " probe_skip=" << (geometry_probe_skipped ? 1 : 0)
++                              << " direct_lookup_hits=" << direct_lookup_hits
++                              << " since=" << frames_since_anchor_
++                              << " geo_jac=" << geometry_jacobian_passes
++                              << " jnt_jac=" << joint_jacobian_passes
++                              << " jnt_trial=" << joint_trial_passes
++                              << " jnt_rej=" << joint_rejected_steps
++                              << " prep_res=" << prep_residuals_ms
++                              << " prep_info=" << prep_photo_info_ms
++                              << " jnt_pre=" << joint_prescreen_passes
++                              << " prep_weak=" << prep_weak_weights_ms);
++    if (seq_counter_ % 50 == 0) {
++      LOG(I, "Geometry starts " << geometry_starts_ << "/" << registration_attempts_
++                                 << ", lambda=" << photo_scale_
++                                 << ", lambda_used=" << photo_config.photo_scale
++                                 << ", beta=" << beta);
++    }
++  } else {
++    LsqRegistration optimizer(*map_, samples.filtered, config_.registration,
++                              config_.intensity.enabled ? &samples.filtered_intensities : nullptr);
++    if (config_.registration.incidence_residual) optimizer.setSourceNormals(&scan_normals);
++    optimizer.freezePhotoConfidence(T_W_I_init);
++    T_W_I = optimizer.computeTransformation(T_W_I_init);
++    n_effective_points = optimizer.numEffectivePoints();
++    n_photometric_points =
++        config_.intensity.enabled ? optimizer.numPhotometricPoints() : -1;
++    n_incidence_points = optimizer.numIncidencePoints();
++    photo_conf_mean = config_.intensity.enabled ? optimizer.meanPhotoConfidence() : -1.0;
++    photo_conf_zero = config_.intensity.enabled ? optimizer.numPhotoConfidenceZero() : -1;
++  }
++  if (config_.observability_state != "off" && block_points > 0 &&
++      H_geo_block.cwiseAbs().maxCoeff() > 0.0) {
++    updateObservability(H_geo_block, H_photo_block, block_points);
++  }
+   align_timer.Stop();
++  if (map_read_lock.owns_lock()) map_read_lock.unlock();
+   if (config_.intensity.enabled) {
+     const IntensitySamplingInfo& info = samples.intensity_info;
+     LOG(D, "Intensity: " << samples.intensity.size() << " points in "
+@@ -173,11 +1193,32 @@ void Pipeline::processFrame(const std::vector<ImuMeasurement>& imu_data,
+   }
+ 
+   // Transform the full cloud using the estimated pose and add it to the map
++  std::unique_lock<std::shared_mutex> map_write_lock;
++  if (config_.pipeline_geo_overlap && prefetched)
++    map_write_lock = std::unique_lock<std::shared_mutex>(pipeline_map_mutex_);
+   timing::Timer map_timer("06_map");
+   const Pointcloud points_registered = T_W_I * points_undistorted_I;
+-  map_->integratePoints(points_registered, &ranges,
+-                        config_.intensity.enabled ? &intensities : nullptr);
++  if (config_.map_integrate_delay > 0) {
++    // Integrate the scan registered during the previous frame, then buffer the
++    // current one. The map therefore lags by one scan.
++    if (map_lag_pending_) {
++      const IntensityView lag_intensities(map_lag_intensities_.data(),
++                                          map_lag_intensities_.size(),
++                                          Eigen::InnerStride<>(1));
++      map_->integratePoints(map_lag_points_, &map_lag_ranges_,
++                            config_.intensity.enabled ? &lag_intensities
++                                                      : nullptr);
++    }
++    map_lag_points_ = points_registered;
++    map_lag_ranges_ = ranges;
++    map_lag_intensities_ = config_.intensity.enabled ? intensities : Intensities();
++    map_lag_pending_ = true;
++  } else {
++    map_->integratePoints(points_registered, &ranges,
++                          config_.intensity.enabled ? &intensities : nullptr);
++  }
+   map_timer.Stop();
++  if (map_write_lock.owns_lock()) map_write_lock.unlock();
+ 
+   // Bookkeeping and optimization of the intertial part of the state
+   addState(imu.back().stamp, T_W_I.quaternion(), T_W_I.translation(), x_j_pred.v);
+@@ -197,7 +1238,7 @@ void Pipeline::processFrame(const std::vector<ImuMeasurement>& imu_data,
+   step_timer.Stop();
+ 
+   if (!config_.log_path.empty()) {
+-    logTUM(nsToS(points_L.end_stamp), T_W_I);
++    logTUM(nsToS(points_filtered_L.end_stamp), T_W_I);
+   }
+ 
+   if (config_.print_timing) {
+@@ -508,7 +1549,41 @@ IntensityPointcloud Pipeline::intensityVoxelCloud(const std::vector<size_t>& vox
+   return cloud;
+ }
+ 
+-bool Pipeline::saveMap() const {
++bool Pipeline::saveMap() {
++  const auto tail_start = std::chrono::steady_clock::now();
++  flushPendingFrame();
++  const double tail_ms = std::chrono::duration<double, std::milli>(
++                             std::chrono::steady_clock::now() - tail_start).count();
++  if (pipeline_calls_ > 0) {
++    LOG(I, "PIPELINE_V27 overlap=" << (config_.pipeline_overlap ? 1 : 0)
++                                   << " frames=" << pipeline_calls_
++                                   << " mean_call_ms=" << pipeline_call_ms_sum_ / pipeline_calls_
++                                   << " tail_ms=" << tail_ms
++                                   << " mean_total_ms="
++                                   << (pipeline_call_ms_sum_ + tail_ms) / pipeline_calls_);
++    LOG(I, "PIPELINE_V28 geo_overlap=" << (config_.pipeline_geo_overlap ? 1 : 0)
++                                       << " reused=" << pipeline_geo_reused_
++                                       << " redone=" << pipeline_geo_redone_
++                                       << " frames=" << pipeline_calls_
++                                       << " mean_total_ms="
++                                       << (pipeline_call_ms_sum_ + tail_ms) / pipeline_calls_);
++    LOG(I, "PIPELINE_V29 geo_threads=" << config_.pipeline_geo_threads
++                                       << " joint_threads=" << config_.pipeline_joint_threads
++                                       << " mean_total_ms="
++                                       << (pipeline_call_ms_sum_ + tail_ms) / pipeline_calls_);
++    LOG(I, "PIPELINE_V31 period=" << config_.registration.geometry_anchor_period
++                                    << " attempted=" << pipeline_geo_attempted_
++                                    << " skipped=" << pipeline_geo_skipped_
++                                    << " reused=" << pipeline_geo_reused_
++                                    << " redone=" << pipeline_geo_redone_
++                                    << " frames=" << pipeline_calls_
++                                    << " mean_total_ms="
++                                    << (pipeline_call_ms_sum_ + tail_ms) / pipeline_calls_);
++    LOG(I, "GEOMETRY_V32 probe_frames=" << geometry_probe_frames_
++                                         << " probe_skipped=" << geometry_probe_skipped_
++                                         << " mean_total_ms="
++                                         << (pipeline_call_ms_sum_ + tail_ms) / pipeline_calls_);
++  }
+   if (config_.map_path.empty()) return false;
+ 
+   std::vector<float> data;  // x, y, z, intensity per point
+diff --git a/config/params.yaml b/config/params.yaml
+index e5a29ff..f3fdbdb 100644
+--- a/config/params.yaml
++++ b/config/params.yaml
+@@ -1,10 +1,37 @@
++pipeline:
++  # Overlap scan-local preprocessing with the previous frame's stateful solve.
++  overlap: false
++  # Experimental overlap of geometry(k) with joint(k-1).
++  geo_overlap: false
++  geo_rebase_translation_m: 0.10
++  geo_rebase_rotation_deg: 1.0
++  geo_threads: 0 # 0 = unrestricted; 2 and 2 for a four-core VM experiment
++  joint_threads: 0
++
+ map:
++  # 0 = integrate each scan at the end of its own frame (default);
++  # 1 = integrate it one frame later, so registration runs against a one-scan
++  #     older map. Used to decouple the two registration stages.
++  integrate_delay: 0
+   pixel_size_m: 0.05 # Pixel side length [m]
+   voxel_size_m: 0.5 # Voxel side length [m]
+   normal_tolerance_deg: 3 # Normal change threshold to trigger reprojection of voxel image [°]
+   smooth: True # Apply smoothing to the voxel image
+   weighted: True # Weighted pixel update
+   max_size: 1500000 # Maximum number of voxels to keep in the map
++  sorted_lookup: False # Registration lookups through a key-sorted voxel index instead of the hash table
++  # Observability state carried across scans: off | report | on.
++  # report only logs how the maintained state compares to the geometry solve;
++  # on skips the geometry-only solve once the state is warm (experimental).
++  observability_state: "off"
++  observability_alpha: 0.25 # Exponential update rate of the maintained information blocks
++  reuse_geometry_linearization: False # Reuse the geometry Jacobian from the prealignment solve
++  geometry_cache_recompute_jacobian: False # Cache statistics only: always rebuild the Jacobian
++  reuse_direct_voxel_lookup: False
++  geometry_probe_enabled: False
++  geometry_probe_max_translation_m: 0.05
++  geometry_probe_max_rotation_deg: 1.0
++  geometry_probe_min_matches: 100
+   frame: "odom"
+ 
+ preprocess:
+@@ -18,7 +45,46 @@ optimization:
+ intensity:
+   enabled: True # Use the LiDAR intensity as additional modality (False: purely geometric BIEVR-LIO)
+   num_voxels: 100 # Number of voxels with the most informative intensity that intensity points are sampled from
+-  photo_scale: 0.002 # Scale of the photometric residuals (intensity in [0, 255]) relative to the geometric residuals [m]
++  photo_scale: 0.0001 # Initial lambda equals the lower bound; fixed value when adaptation is off
++  sequential_photo: True # Geometry prealignment followed by one joint optimization
++  second_stage_mode: joint_weak_photo # Geometry + intensity, weak-direction-aware photometric points
++  adaptive_photo_scale: True # Update lambda only when geometry agrees with the IMU prediction
++  photo_scale_mode: continuous # continuous | window | discrete
++  photo_window_frames: 50 # Used only by window mode
++  adaptive_photo_guard: False # Experimental v7 soft reduction; enable only in trial configs
++  # Geometry re-anchoring. 1 = run the geometry-only solve on every scan (baseline).
++  # N > 1 runs it once every N scans and reuses the anchored pose/information in
++  # between; the pose is advanced by the IMU prediction of the current scan.
++  geometry_anchor_period: 1
++  # Re-anchor early when the scan has moved this far from the anchor pose [m].
++  geometry_anchor_max_drift_m: 1.0
++  # LM trial pre-screen: evaluate the trial cost on every stride-th point and
++  # reject early when it is clearly worse. 1 disables it.
++  lm_trial_stride: 1
++  # Relative-cost margin the subsample must fall below before rejecting.
++  lm_prescreen_margin: -0.05
++  photo_guard_fraction: 0.5 # Target intensity/geometry information ratio in strong directions
++  photo_guard_max_alpha: 0.02 # Maximum fractional move toward the high-side target per scan
++  adaptive_beta: False # Keep beta off while testing the adaptive lambda alone
++  stage_max_translation_m: 0.05 # Maximum geometry-start displacement from IMU prediction
++  stage_max_rotation_deg: 1.0
++  photo_scale_min: 0.0001 # Starting value and lower bound of adaptive lambda
++  photo_scale_max: 0.003
++  photo_scale_max_alpha: 0.15 # Maximum per-frame exponential update; reduced by photo match quality
++  # Viewing-geometry confidence of the photometric residuals. A map pixel was written from another
++  # range and incidence angle, so part of every intensity difference is geometric (range falloff,
++  # grazing incidence) rather than reflectance. With this enabled the difference is weighted by a
++  # ramp in incidence angle times a ramp in range; the weight only touches the observation, not the
++  # adaptive scale. False reproduces the baseline bit-exactly.
++  photo_confidence: False
++  incidence_residual: False # Independent current-scan normal versus map-plane incidence
++  incidence_scale: 0.1 # Metres per unit cosine-incidence difference
++  confidence_incidence_full_deg: 55 # Full weight below this angle of incidence to the surface [deg]
++  confidence_incidence_deg: 80 # Zero weight above this angle of incidence [deg]
++  confidence_range_full_m: 15 # Full weight below this range [m]
++  confidence_range_stop_m: 30 # Zero weight beyond this range [m]
++  confidence_min: 0.0 # Lower bound of the confidence; set above zero to retain a weight floor
++  confidence_in_photo_information: True # Let the confidence shape the lambda estimate (False freezes it)
+   smooth: True # Apply smoothing to the voxel intensity map
+   max_range_m: 30 # Points farther than this range [m] are not used for intensity (weak, noisy returns)
+   # The intensity image used for the brightness normalization is sensor specific and is set in the
+@@ -38,4 +104,4 @@ debug:
+   trajectory_path: "" # Path to save trajectory. If empty, logs will not be saved.
+   map_path: "" # Path to save the map (PCD with intensity) when the node finishes. If empty, the map will not be saved.
+ 
+-max_num_threads: 0 # 0 = automatic, >0 = number of threads to use for parallel processing
+\ No newline at end of file
++max_num_threads: 0 # 0 = automatic, >0 = number of threads to use for parallel processing
